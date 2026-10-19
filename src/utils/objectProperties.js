@@ -21,5 +21,6 @@ export function extractObjectProperties(obj) {
     fontStyle: obj.fontStyle,
     underline: !!obj.underline,
     textAlign: obj.textAlign,
+    linkUrl: obj.linkUrl || '',
   };
 }

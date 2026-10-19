@@ -41,6 +41,49 @@ export function validatePdfFile(file) {
   return { valid: true };
 }
 
+export const SUPPORTED_IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp'];
+
+/**
+ * Check if a file is a supported image
+ * @param {File} file
+ * @returns {boolean}
+ */
+export function isImageFile(file) {
+  if (!file) return false;
+  const name = (file.name || '').toLowerCase();
+  const type = (file.type || '').toLowerCase();
+  return (
+    type.startsWith('image/') ||
+    SUPPORTED_IMAGE_EXTENSIONS.some((ext) => name.endsWith(ext))
+  );
+}
+
+/**
+ * Validate either a PDF file or an Image file.
+ * @param {File} file
+ * @returns {{ valid: boolean, isImage: boolean, error?: string }}
+ */
+export function validateDocumentOrImageFile(file) {
+  if (!file) {
+    return { valid: false, isImage: false, error: FILE_VALIDATION_ERRORS.NO_FILE };
+  }
+
+  if (file.size === 0) {
+    return { valid: false, isImage: false, error: FILE_VALIDATION_ERRORS.EMPTY_FILE };
+  }
+
+  if (file.size > MAX_FILE_SIZE_BYTES) {
+    return { valid: false, isImage: false, error: FILE_VALIDATION_ERRORS.EXCEEDS_SIZE_LIMIT };
+  }
+
+  if (isImageFile(file)) {
+    return { valid: true, isImage: true };
+  }
+
+  const pdfValidation = validatePdfFile(file);
+  return { ...pdfValidation, isImage: false };
+}
+
 /**
  * Validates the raw binary header of a PDF ArrayBuffer.
  * Per ISO 32000-1, conforming readers accept %PDF- anywhere within the first 1024 bytes.

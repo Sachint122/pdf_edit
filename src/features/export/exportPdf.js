@@ -4,12 +4,60 @@
  * and vector editing layers (text, shapes, drawings, images, signatures) into a valid modified PDF using pdf-lib.
  */
 
-import { PDFDocument, degrees, rgb } from 'pdf-lib';
+import { PDFDocument, degrees, rgb, PDFName, PDFString } from 'pdf-lib';
 import { FontManager } from './fontManager.js';
 import { toPdfLibRgb } from './colorParser.js';
 import { applyWatermark, applyPageNumber } from '../advanced/watermarkManager.js';
 import { applyPdfMetadata } from '../advanced/pdfMetadata.js';
 import { sanitizeForWinAnsi } from '../../utils/textSanitizer.js';
+
+/**
+ * Add a clickable URI Link annotation to a PDF page
+ * @param {import('pdf-lib').PDFDocument} outDoc
+ * @param {import('pdf-lib').PDFPage} targetPage
+ * @param {number[]} rect - [x1, y1, x2, y2] in PDF point coordinates
+ * @param {string} url - Target link URL
+ */
+export function addLinkAnnotation(outDoc, targetPage, rect, url) {
+  if (!outDoc || !targetPage || !url || !Array.isArray(rect) || rect.length !== 4) return;
+  try {
+    let cleanUrl = String(url).trim();
+    if (!cleanUrl) return;
+    if (!/^https?:\/\//i.test(cleanUrl) && !/^mailto:/i.test(cleanUrl) && !/^tel:/i.test(cleanUrl)) {
+      cleanUrl = `https://${cleanUrl}`;
+    }
+
+    const [x1, y1, x2, y2] = rect;
+    const validRect = [
+      Math.min(x1, x2),
+      Math.min(y1, y2),
+      Math.max(x1, x2),
+      Math.max(y1, y2),
+    ];
+
+    const linkAnnotation = outDoc.context.obj({
+      Type: 'Annot',
+      Subtype: 'Link',
+      Rect: validRect,
+      Border: [0, 0, 0],
+      A: {
+        Type: 'Action',
+        S: 'URI',
+        URI: PDFString.of(cleanUrl),
+      },
+    });
+
+    const linkAnnotationRef = outDoc.context.register(linkAnnotation);
+    const annots = targetPage.node.get(PDFName.of('Annots'));
+    if (!annots) {
+      targetPage.node.set(PDFName.of('Annots'), outDoc.context.obj([linkAnnotationRef]));
+    } else {
+      outDoc.context.lookup(annots).push(linkAnnotationRef);
+    }
+  } catch (err) {
+    console.warn('Could not attach link annotation:', err);
+  }
+}
 
 /**
  * Convert WebP or non-standard image DataURL to PNG DataURL in browser environment
@@ -193,9 +241,11 @@ export async function exportModifiedPdf(originalBuffer, pages = [], pageEdits = 
 
           const isContentEdit = !!obj.isPdfContentEdit;
           const linesInfo = Array.isArray(obj.linesInfo) && obj.linesInfo.length > 0 ? obj.linesInfo : null;
+          const textAlign = obj.textAlign || 'left';
 
           if (isContentEdit) {
-            // Compute replacement text width using pdf-lib font metrics
+            if (!obj.isLinkOnly) {
+              // Compute replacement text width using pdf-lib font metrics
             let maxReplacementTextWidth = 0;
             for (const lineText of lines) {
               try {
@@ -217,8 +267,12 @@ export async function exportModifiedPdf(originalBuffer, pages = [], pageEdits = 
             if (obj.backgroundColor && obj.backgroundColor !== 'transparent') {
               const bgRgb = toPdfLibRgb(obj.backgroundColor) || rgb(1, 1, 1);
               for (const lInfo of whiteoutLines) {
-                const lLeft = Number.isFinite(lInfo.pdfLeft) ? lInfo.pdfLeft : objLeft;
-                const origWidth = Number.isFinite(lInfo.pdfWidth) ? lInfo.pdfWidth : ((obj.width || 100) * (obj.scaleX || 1));
+                const lLeft = Number.isFinite(lInfo.paraLeft)
+                  ? lInfo.paraLeft
+                  : (Number.isFinite(lInfo.pdfLeft) ? lInfo.pdfLeft : objLeft);
+                const origWidth = Number.isFinite(lInfo.paraWidth)
+                  ? lInfo.paraWidth
+                  : (Number.isFinite(lInfo.pdfWidth) ? lInfo.pdfWidth : ((obj.width || 100) * (obj.scaleX || 1)));
                 const lFontSize = Number.isFinite(lInfo.rawFontSize) ? lInfo.rawFontSize : fontSize;
                 const lBaseVy = Number.isFinite(lInfo.baseVy) ? lInfo.baseVy : (objTop + lFontSize * 0.76);
 
@@ -228,7 +282,6 @@ export async function exportModifiedPdf(originalBuffer, pages = [], pageEdits = 
                 // Bottom of whiteout rectangle = yBaseline - 0.20 * fontSize
                 // Height = 0.96 * fontSize
                 // Top of whiteout rectangle = yBaseline + 0.76 * fontSize
-                // This leaves a clean safety gap above the next line, completely eliminating line overlap
                 const stripY = pHeight - lBaseVy - (lFontSize * 0.20);
                 const stripHeight = lFontSize * 0.96;
                 const maskWidth = Math.max(origWidth, maxReplacementTextWidth) + 4;
@@ -245,20 +298,17 @@ export async function exportModifiedPdf(originalBuffer, pages = [], pageEdits = 
               }
             }
 
-            // Draw replacement text exactly on original baselines
+            // Draw replacement text exactly on original baselines with alignment support
             for (let l = 0; l < lines.length; l++) {
               const lineText = lines[l];
               if (lineText.length === 0) continue;
 
-              let lineX = objLeft;
-              let lineY;
+              const lInfo = (linesInfo && l < linesInfo.length) ? linesInfo[l] : null;
 
-              if (linesInfo && l < linesInfo.length && Number.isFinite(linesInfo[l].baseVy)) {
+              let lineY;
+              if (lInfo && Number.isFinite(lInfo.baseVy)) {
                 // Exact baseline match
-                lineY = pHeight - linesInfo[l].baseVy;
-                lineX = Number.isFinite(linesInfo[l].pdfX)
-                  ? linesInfo[l].pdfX
-                  : (Number.isFinite(linesInfo[l].pdfLeft) ? linesInfo[l].pdfLeft + 1 : objLeft);
+                lineY = pHeight - lInfo.baseVy;
               } else {
                 // Fallback for additional lines or single block
                 const firstBaseVy = (linesInfo && linesInfo.length > 0 && Number.isFinite(linesInfo[0].baseVy))
@@ -267,31 +317,157 @@ export async function exportModifiedPdf(originalBuffer, pages = [], pageEdits = 
                 lineY = pHeight - (firstBaseVy + l * lineHeight);
               }
 
-              targetPage.drawText(lineText, {
-                x: lineX,
-                y: lineY,
-                size: fontSize,
-                font,
-                color: textColor,
-                opacity: obj.opacity ?? 1,
-                rotate: objAngle !== 0 ? degrees(-objAngle) : undefined,
-              });
+              // Determine boundaries for alignment
+              const boundLeft = (lInfo && Number.isFinite(lInfo.paraLeft))
+                ? lInfo.paraLeft
+                : (lInfo && Number.isFinite(lInfo.pdfLeft)
+                  ? lInfo.pdfLeft
+                  : (lInfo && Number.isFinite(lInfo.pdfX) ? lInfo.pdfX : objLeft));
+
+              const boundWidth = (lInfo && Number.isFinite(lInfo.paraWidth))
+                ? lInfo.paraWidth
+                : (lInfo && Number.isFinite(lInfo.pdfWidth)
+                  ? lInfo.pdfWidth
+                  : (lInfo && Number.isFinite(lInfo.rawWidth) ? lInfo.rawWidth : ((obj.width || 100) * (obj.scaleX || 1))));
+
+              const isLastLine = (lInfo && typeof lInfo.isLastLine !== 'undefined')
+                ? lInfo.isLastLine
+                : (l === lines.length - 1);
+
+              let lineWidth = 0;
+              try {
+                lineWidth = font.widthOfTextAtSize(lineText, fontSize);
+              } catch {
+                lineWidth = lineText.length * fontSize * 0.55;
+              }
+
+              if (textAlign === 'center') {
+                const lineX = boundLeft + Math.max(0, (boundWidth - lineWidth) / 2);
+                targetPage.drawText(lineText, {
+                  x: lineX,
+                  y: lineY,
+                  size: fontSize,
+                  font,
+                  color: textColor,
+                  opacity: obj.opacity ?? 1,
+                  rotate: objAngle !== 0 ? degrees(-objAngle) : undefined,
+                });
+              } else if (textAlign === 'right') {
+                const lineX = boundLeft + Math.max(0, boundWidth - lineWidth);
+                targetPage.drawText(lineText, {
+                  x: lineX,
+                  y: lineY,
+                  size: fontSize,
+                  font,
+                  color: textColor,
+                  opacity: obj.opacity ?? 1,
+                  rotate: objAngle !== 0 ? degrees(-objAngle) : undefined,
+                });
+              } else if (textAlign === 'justify') {
+                // Justify distributes paragraph text across available line width,
+                // leaving the final line naturally aligned to the left.
+                if (isLastLine) {
+                  targetPage.drawText(lineText, {
+                    x: boundLeft,
+                    y: lineY,
+                    size: fontSize,
+                    font,
+                    color: textColor,
+                    opacity: obj.opacity ?? 1,
+                    rotate: objAngle !== 0 ? degrees(-objAngle) : undefined,
+                  });
+                } else {
+                  const words = lineText.trim().split(/\s+/).filter(Boolean);
+                  if (words.length <= 1) {
+                    targetPage.drawText(lineText, {
+                      x: boundLeft,
+                      y: lineY,
+                      size: fontSize,
+                      font,
+                      color: textColor,
+                      opacity: obj.opacity ?? 1,
+                      rotate: objAngle !== 0 ? degrees(-objAngle) : undefined,
+                    });
+                  } else {
+                    let totalWordsWidth = 0;
+                    const wordWidths = [];
+                    for (const w of words) {
+                      let ww = 0;
+                      try {
+                        ww = font.widthOfTextAtSize(w, fontSize);
+                      } catch {
+                        ww = w.length * fontSize * 0.55;
+                      }
+                      wordWidths.push(ww);
+                      totalWordsWidth += ww;
+                    }
+
+                    let normalSpaceWidth = fontSize * 0.28;
+                    try {
+                      normalSpaceWidth = font.widthOfTextAtSize(' ', fontSize);
+                    } catch {
+                      normalSpaceWidth = fontSize * 0.28;
+                    }
+
+                    const remainingSpace = boundWidth - totalWordsWidth;
+                    const gapCount = words.length - 1;
+
+                    // If the line is short (< 80% of boundWidth) or space is negative, keep natural left-aligned spacing.
+                    // Otherwise distribute across width, but clamp gapWidth to maximum 1.35x normalSpaceWidth
+                    // to eliminate excessive spacing and unnatural rivers between words.
+                    const isShortLine = totalWordsWidth < boundWidth * 0.80;
+                    const rawGap = (gapCount > 0 && remainingSpace > 0) ? (remainingSpace / gapCount) : normalSpaceWidth;
+                    const maxGap = normalSpaceWidth * 1.35;
+
+                    const gapWidth = isShortLine
+                      ? normalSpaceWidth
+                      : Math.min(maxGap, Math.max(normalSpaceWidth, rawGap));
+
+                    let curX = boundLeft;
+                    for (let wIdx = 0; wIdx < words.length; wIdx++) {
+                      targetPage.drawText(words[wIdx], {
+                        x: curX,
+                        y: lineY,
+                        size: fontSize,
+                        font,
+                        color: textColor,
+                        opacity: obj.opacity ?? 1,
+                        rotate: objAngle !== 0 ? degrees(-objAngle) : undefined,
+                      });
+                      curX += wordWidths[wIdx] + (wIdx < gapCount ? gapWidth : 0);
+                    }
+                  }
+                }
+              } else {
+                // Default: 'left'
+                targetPage.drawText(lineText, {
+                  x: boundLeft,
+                  y: lineY,
+                  size: fontSize,
+                  font,
+                  color: textColor,
+                  opacity: obj.opacity ?? 1,
+                  rotate: objAngle !== 0 ? degrees(-objAngle) : undefined,
+                });
+              }
             }
+          }
           } else {
             // Standard non-content-edit user text box
             const pad = obj.padding || 0;
             const startY = pHeight - (objTop + fontSize * 0.85);
+            const boxWidth = (obj.width || 100) * (obj.scaleX || 1);
+            const contentWidth = Math.max(0, boxWidth - pad * 2);
 
             // Draw solid background rectangle if specified
             if (obj.backgroundColor && obj.backgroundColor !== 'transparent') {
               const bgRgb = toPdfLibRgb(obj.backgroundColor);
               if (bgRgb) {
-                const bgWidth = (obj.width || 100) * (obj.scaleX || 1);
                 const bgHeight = Math.max(fontSize * lines.length * 1.2, (obj.height || fontSize) * (obj.scaleY || 1));
                 targetPage.drawRectangle({
                   x: objLeft - pad,
                   y: pHeight - objTop - bgHeight - pad,
-                  width: bgWidth + pad * 2,
+                  width: boxWidth + pad * 2,
                   height: bgHeight + pad * 2,
                   color: bgRgb,
                   opacity: obj.opacity ?? 1,
@@ -302,10 +478,100 @@ export async function exportModifiedPdf(originalBuffer, pages = [], pageEdits = 
 
             for (let l = 0; l < lines.length; l++) {
               const lineText = lines[l];
-              if (lineText.length > 0) {
+              if (lineText.length === 0) continue;
+
+              const lineY = startY - l * lineHeight;
+              let lineWidth = 0;
+              try {
+                lineWidth = font.widthOfTextAtSize(lineText, fontSize);
+              } catch {
+                lineWidth = lineText.length * fontSize * 0.55;
+              }
+
+              if (textAlign === 'center') {
+                const lineX = objLeft + pad + Math.max(0, (contentWidth - lineWidth) / 2);
+                targetPage.drawText(lineText, {
+                  x: lineX,
+                  y: lineY,
+                  size: fontSize,
+                  font,
+                  color: textColor,
+                  opacity: obj.opacity ?? 1,
+                  rotate: objAngle !== 0 ? degrees(-objAngle) : undefined,
+                });
+              } else if (textAlign === 'right') {
+                const lineX = objLeft + pad + Math.max(0, contentWidth - lineWidth);
+                targetPage.drawText(lineText, {
+                  x: lineX,
+                  y: lineY,
+                  size: fontSize,
+                  font,
+                  color: textColor,
+                  opacity: obj.opacity ?? 1,
+                  rotate: objAngle !== 0 ? degrees(-objAngle) : undefined,
+                });
+              } else if (textAlign === 'justify') {
+                const isLastLine = (l === lines.length - 1);
+                if (isLastLine || lines.length === 1) {
+                  targetPage.drawText(lineText, {
+                    x: objLeft + pad,
+                    y: lineY,
+                    size: fontSize,
+                    font,
+                    color: textColor,
+                    opacity: obj.opacity ?? 1,
+                    rotate: objAngle !== 0 ? degrees(-objAngle) : undefined,
+                  });
+                } else {
+                  const words = lineText.trim().split(/\s+/);
+                  if (words.length <= 1) {
+                    targetPage.drawText(lineText, {
+                      x: objLeft + pad,
+                      y: lineY,
+                      size: fontSize,
+                      font,
+                      color: textColor,
+                      opacity: obj.opacity ?? 1,
+                      rotate: objAngle !== 0 ? degrees(-objAngle) : undefined,
+                    });
+                  } else {
+                    let totalWordsWidth = 0;
+                    const wordWidths = [];
+                    for (const w of words) {
+                      let ww = 0;
+                      try {
+                        ww = font.widthOfTextAtSize(w, fontSize);
+                      } catch {
+                        ww = w.length * fontSize * 0.55;
+                      }
+                      wordWidths.push(ww);
+                      totalWordsWidth += ww;
+                    }
+                    const remainingSpace = contentWidth - totalWordsWidth;
+                    const gapCount = words.length - 1;
+                    const gapWidth = (gapCount > 0 && remainingSpace > 0)
+                      ? (remainingSpace / gapCount)
+                      : (fontSize * 0.25);
+
+                    let curX = objLeft + pad;
+                    for (let wIdx = 0; wIdx < words.length; wIdx++) {
+                      targetPage.drawText(words[wIdx], {
+                        x: curX,
+                        y: lineY,
+                        size: fontSize,
+                        font,
+                        color: textColor,
+                        opacity: obj.opacity ?? 1,
+                        rotate: objAngle !== 0 ? degrees(-objAngle) : undefined,
+                      });
+                      curX += wordWidths[wIdx] + gapWidth;
+                    }
+                  }
+                }
+              } else {
                 targetPage.drawText(lineText, {
                   x: objLeft + pad,
-                  y: startY - l * lineHeight,
+                  y: lineY,
                   size: fontSize,
                   font,
                   color: textColor,
@@ -314,6 +580,17 @@ export async function exportModifiedPdf(originalBuffer, pages = [], pageEdits = 
                 });
               }
             }
+          }
+
+          // Attach Clickable Hyperlink Annotation if specified on text object
+          if (obj.linkUrl && typeof obj.linkUrl === 'string' && obj.linkUrl.trim().length > 0) {
+            const rectX1 = Math.max(0, objLeft);
+            const rectWidth = Math.max(10, (obj.width || 100) * (obj.scaleX || 1));
+            const rectHeight = Math.max(fontSize, (obj.height || (fontSize * lines.length * 1.2)) * (obj.scaleY || 1));
+            const rectY1 = Math.max(0, pHeight - objTop - rectHeight);
+            const rectX2 = rectX1 + rectWidth;
+            const rectY2 = rectY1 + rectHeight;
+            addLinkAnnotation(outDoc, targetPage, [rectX1, rectY1, rectX2, rectY2], obj.linkUrl);
           }
         }
 

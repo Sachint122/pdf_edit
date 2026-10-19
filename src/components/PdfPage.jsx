@@ -6,6 +6,13 @@
 
 import React, { useEffect, useRef, useState } from 'react';
 import { Canvas } from 'fabric';
+import {
+  AlignLeft,
+  AlignCenter,
+  AlignRight,
+  AlignJustify,
+  Link,
+} from 'lucide-react';
 import { renderPdfPage, cancelPdfPageRender } from '../features/pdf-viewer/pageRenderer.js';
 import {
   enablePenMode,
@@ -15,6 +22,54 @@ import {
 import { extractObjectProperties } from '../utils/objectProperties.js';
 import { extractPageTextBlocks } from '../features/editing/pdfContentEditor.js';
 
+let textMeasureCtx = null;
+/**
+ * Computes natural typographic word distribution for justified alignment.
+ * Avoids excessive word spacing and clamps gap to natural limits matching PDF export.
+ */
+function computeJustifiedGap(text, containerWidth, fontSize, fontStack, isBold, isItalic) {
+  const words = (text || '').trim().split(/\s+/).filter(Boolean);
+  const normalSpace = fontSize * 0.28;
+  if (words.length <= 1) {
+    return { gap: normalSpace, words };
+  }
+
+  let totalWordsWidth = 0;
+  if (typeof document !== 'undefined') {
+    if (!textMeasureCtx) {
+      const c = document.createElement('canvas');
+      textMeasureCtx = c.getContext('2d');
+    }
+    if (textMeasureCtx) {
+      textMeasureCtx.font = `${isBold ? 'bold ' : ''}${isItalic ? 'italic ' : ''}${fontSize}px ${fontStack}`;
+      for (const w of words) {
+        totalWordsWidth += textMeasureCtx.measureText(w).width;
+      }
+    }
+  }
+
+  if (totalWordsWidth === 0) {
+    totalWordsWidth = words.join('').length * fontSize * 0.52;
+  }
+
+  const availableWidth = Math.max(20, containerWidth);
+  const remaining = availableWidth - totalWordsWidth;
+  const gapCount = words.length - 1;
+
+  // Natural maximum gap threshold (1.35x normal space width) to avoid excessive spacing between words
+  const maxGap = normalSpace * 1.35;
+
+  // If the line is short (< 80% of available width) or words overflow, keep natural spacing
+  if (totalWordsWidth < availableWidth * 0.80 || remaining <= 0) {
+    return { gap: normalSpace, words };
+  }
+
+  const rawGap = remaining / gapCount;
+  const clampedGap = Math.min(maxGap, Math.max(normalSpace, rawGap));
+
+  return { gap: clampedGap, words };
+}
+
 export function PdfPage({
   pdfDoc,
   page,
@@ -23,7 +78,10 @@ export function PdfPage({
   activeTool = 'edit-content',
   savedEdits = null,
   selectedBlockId = null,
+  selectedObject = null,
+  initialOcrBlocks = null,
   onSelectContentBlock,
+  onApplyAlignment,
   onPageVisible,
   onPageEditsChange,
   onObjectSelected,
@@ -144,50 +202,199 @@ export function PdfPage({
     extractPageTextBlocks(pdfDoc, page.originalIndex, scale, rotation)
       .then((blocks) => {
         if (isSubscribed) {
-          setTextBlocks(blocks);
+          if ((!blocks || blocks.length === 0) && Array.isArray(initialOcrBlocks) && initialOcrBlocks.length > 0) {
+            const scaled = initialOcrBlocks.map((b) => ({
+              ...b,
+              screenLeft: b.left * scale,
+              screenTop: b.top * scale,
+              screenWidth: b.width * scale,
+              screenHeight: b.height * scale,
+            }));
+            setTextBlocks(scaled);
+          } else {
+            setTextBlocks(blocks);
+          }
         }
       })
       .catch((err) => {
         console.warn(`Error extracting text blocks for page ${pageNumber}:`, err);
+        if (isSubscribed && Array.isArray(initialOcrBlocks) && initialOcrBlocks.length > 0) {
+          const scaled = initialOcrBlocks.map((b) => ({
+            ...b,
+            screenLeft: b.left * scale,
+            screenTop: b.top * scale,
+            screenWidth: b.width * scale,
+            screenHeight: b.height * scale,
+          }));
+          setTextBlocks(scaled);
+        }
       });
 
     return () => {
       isSubscribed = false;
       setTextBlocks([]);
     };
-  }, [pdfDoc, page?.originalIndex, page?.isBlank, pageNumber, scale, rotation]);
+  }, [pdfDoc, page?.originalIndex, page?.isBlank, pageNumber, scale, rotation, initialOcrBlocks]);
 
-  // Enrich text blocks with real background color from the rendered canvas
+  // Enrich text blocks with real background color and text color from the rendered canvas
   useEffect(() => {
     if (!isRendered || !pdfCanvasRef.current) return;
 
     try {
       const canvas = pdfCanvasRef.current;
       const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      if (!ctx) return;
+      if (!ctx || canvas.width <= 0 || canvas.height <= 0) return;
 
       const dpr = window.devicePixelRatio || 1;
+      const cWidth = canvas.width;
+      const cHeight = canvas.height;
+      const imgData = ctx.getImageData(0, 0, cWidth, cHeight).data;
 
       setTextBlocks((prevBlocks) => {
         if (!prevBlocks || prevBlocks.length === 0) return prevBlocks;
         let hasUpdate = false;
         const updated = prevBlocks.map((b) => {
-          if (b.sampledBg) return b;
-          const sx = Math.max(0, Math.min(canvas.width - 1, Math.round(((b.screenLeft ?? b.left) - 3) * dpr)));
-          const sy = Math.max(0, Math.min(canvas.height - 1, Math.round(((b.screenTop ?? b.top) + (b.screenHeight ?? b.height) / 2) * dpr)));
-          const pixel = ctx.getImageData(sx, sy, 1, 1).data;
-          if (pixel[3] < 20) return { ...b, sampledBg: true };
+          if (b.sampledBg && (!b.isOcrDetected || b.sampledText)) return b;
 
-          const r = pixel[0].toString(16).padStart(2, '0');
-          const g = pixel[1].toString(16).padStart(2, '0');
-          const bHex = pixel[2].toString(16).padStart(2, '0');
-          const hex = `#${r}${g}${bHex}`;
+          let newBg = b.backgroundColor;
+          let newColor = b.fill || b.color;
+          let bgUpdated = false;
 
-          if (hex !== b.backgroundColor) {
-            hasUpdate = true;
-            return { ...b, backgroundColor: hex, sampledBg: true };
+          const sx = Math.max(0, Math.min(cWidth - 1, Math.round(((b.screenLeft ?? b.left) - 3) * dpr)));
+          const sy = Math.max(0, Math.min(cHeight - 1, Math.round(((b.screenTop ?? b.top) + (b.screenHeight ?? b.height) / 2) * dpr)));
+          const pixelIdx = (sy * cWidth + sx) * 4;
+
+          let bgLum = 255;
+          if (imgData[pixelIdx + 3] >= 20) {
+            const r = imgData[pixelIdx];
+            const g = imgData[pixelIdx + 1];
+            const bVal = imgData[pixelIdx + 2];
+            bgLum = 0.299 * r + 0.587 * g + 0.114 * bVal;
+            const hex = `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${bVal.toString(16).padStart(2, '0')}`;
+            if (hex !== b.backgroundColor) {
+              newBg = hex;
+              bgUpdated = true;
+            }
           }
-          return { ...b, sampledBg: true };
+
+          // Sample actual text color, background, bold styling, and font family from image for OCR text blocks
+          let textUpdated = false;
+          let detectedBold = b.isBold;
+          let detectedFont = b.fontFamily || 'Helvetica';
+          let updatedParaLines = b.paraLines;
+
+          if (b.isOcrDetected && !b.sampledText) {
+            const boxLeft = b.screenLeft ?? b.left;
+            const boxWidth = b.screenWidth ?? b.width;
+            const boxTop = b.screenTop ?? b.top;
+            const boxHeight = b.screenHeight ?? b.height;
+            const sampleSteps = 7;
+            let maxContrast = 0;
+            let bestHex = null;
+
+            for (let step = 1; step <= sampleSteps; step++) {
+              const tx = Math.max(0, Math.min(cWidth - 1, Math.round((boxLeft + (boxWidth * step) / (sampleSteps + 1)) * dpr)));
+              const ty = Math.max(0, Math.min(cHeight - 1, Math.round((boxTop + boxHeight * 0.5) * dpr)));
+              const tIdx = (ty * cWidth + tx) * 4;
+              if (imgData[tIdx + 3] >= 50) {
+                const tr = imgData[tIdx];
+                const tg = imgData[tIdx + 1];
+                const tb = imgData[tIdx + 2];
+                const tLum = 0.299 * tr + 0.587 * tg + 0.114 * tb;
+                const contrast = Math.abs(tLum - bgLum);
+                if (contrast > maxContrast && contrast > 30) {
+                  maxContrast = contrast;
+                  bestHex = `#${tr.toString(16).padStart(2, '0')}${tg.toString(16).padStart(2, '0')}${tb.toString(16).padStart(2, '0')}`;
+                }
+              }
+            }
+
+            if (bestHex && bestHex !== b.fill) {
+              newColor = bestHex;
+              textUpdated = true;
+            }
+
+            // Sample ink density to detect bold styling
+            let inkCount = 0;
+            let totalChecked = 0;
+            const yStart = Math.max(0, Math.min(cHeight - 1, Math.round((boxTop + boxHeight * 0.2) * dpr)));
+            const yEnd = Math.max(0, Math.min(cHeight - 1, Math.round((boxTop + boxHeight * 0.8) * dpr)));
+            const xStart = Math.max(0, Math.min(cWidth - 1, Math.round((boxLeft + 2) * dpr)));
+            const xEnd = Math.max(0, Math.min(cWidth - 1, Math.round((boxLeft + boxWidth - 2) * dpr)));
+            const stepX = Math.max(1, Math.round((xEnd - xStart) / 25));
+            const stepY = Math.max(1, Math.round((yEnd - yStart) / 8));
+
+            for (let y = yStart; y <= yEnd; y += stepY) {
+              for (let x = xStart; x <= xEnd; x += stepX) {
+                const idx = (y * cWidth + x) * 4;
+                if (imgData[idx + 3] >= 50) {
+                  const lum = 0.299 * imgData[idx] + 0.587 * imgData[idx + 1] + 0.114 * imgData[idx + 2];
+                  if (Math.abs(lum - bgLum) > 35) {
+                    inkCount++;
+                  }
+                  totalChecked++;
+                }
+              }
+            }
+
+            const inkRatio = totalChecked > 0 ? (inkCount / totalChecked) : 0;
+            detectedBold = Boolean(b.isBold || inkRatio >= 0.23);
+
+            // Detect serif footings vs clean sans-serif stems
+            let baselineInk = 0;
+            let midInk = 0;
+            const baseLineY = Math.max(0, Math.min(cHeight - 1, Math.round((boxTop + boxHeight * 0.82) * dpr)));
+            const midLineY = Math.max(0, Math.min(cHeight - 1, Math.round((boxTop + boxHeight * 0.5) * dpr)));
+            for (let x = xStart; x <= xEnd; x += stepX) {
+              const bIdx = (baseLineY * cWidth + x) * 4;
+              const mIdx = (midLineY * cWidth + x) * 4;
+              if (imgData[bIdx + 3] >= 50) {
+                const bL = 0.299 * imgData[bIdx] + 0.587 * imgData[bIdx + 1] + 0.114 * imgData[bIdx + 2];
+                if (Math.abs(bL - bgLum) > 35) baselineInk++;
+              }
+              if (imgData[mIdx + 3] >= 50) {
+                const mL = 0.299 * imgData[mIdx] + 0.587 * imgData[mIdx + 1] + 0.114 * imgData[mIdx + 2];
+                if (Math.abs(mL - bgLum) > 35) midInk++;
+              }
+            }
+            detectedFont = (b.fontFamily && b.fontFamily !== 'Helvetica')
+              ? b.fontFamily
+              : (midInk > 0 && (baselineInk / midInk) >= 1.45 ? 'Times' : 'Helvetica');
+
+            if (detectedBold !== b.isBold || detectedFont !== b.fontFamily) {
+              textUpdated = true;
+            }
+
+            if (Array.isArray(b.paraLines)) {
+              updatedParaLines = b.paraLines.map((l) => ({
+                ...l,
+                fill: newColor,
+                color: newColor,
+                backgroundColor: newBg,
+                fontFamily: detectedFont,
+                isBold: detectedBold,
+                fontWeight: detectedBold ? 'bold' : 'normal',
+              }));
+            }
+          }
+
+          if (bgUpdated || textUpdated) {
+            hasUpdate = true;
+            return {
+              ...b,
+              backgroundColor: newBg,
+              fill: newColor,
+              color: newColor,
+              fontFamily: detectedFont,
+              isBold: detectedBold,
+              fontWeight: detectedBold ? 'bold' : 'normal',
+              paraLines: updatedParaLines,
+              sampledBg: true,
+              sampledText: true,
+            };
+          }
+
+          return { ...b, sampledBg: true, sampledText: true };
         });
         return hasUpdate ? updated : prevBlocks;
       });
@@ -243,7 +450,7 @@ export function PdfPage({
     // Change listeners to synchronize edits state
     const handleChange = () => {
       if (typeof callbacksRef.current.onPageEditsChange === 'function') {
-        const json = fabricCanvas.toJSON();
+        const json = fabricCanvas.toJSON(['linkUrl', 'isPdfContentEdit', 'originalBlockId', 'textAlign', 'isLinkOnly']);
         callbacksRef.current.onPageEditsChange(page.id, json);
       }
     };
@@ -354,44 +561,88 @@ export function PdfPage({
       <div className={`absolute inset-0 z-12 ${activeTool === 'edit-content' ? 'pointer-events-auto' : 'pointer-events-none'}`}>
         {textBlocks.map((block) => {
           const contentEdits = savedEdits?.contentEdits || {};
-          const isEdited = !!contentEdits[block.id];
-          const currentText = isEdited ? contentEdits[block.id].text : block.str;
-          const isSelected = selectedBlockId === block.id;
-          const exactSize = (block.rawFontSize || block.pdfFontSize || block.fontSize || 12) * scale;
-          const isBold = block.isBold || block.fontWeight === 'bold';
-          const isItalic = block.isItalic || block.fontStyle === 'italic';
+          const currentEdit = contentEdits[block.id];
+          const isEdited = !!currentEdit;
+          const currentText = isEdited ? currentEdit.text : block.str;
+          const textAlign = currentEdit?.textAlign || block.textAlign || 'left';
+          const paraBoundaries = currentEdit?.paraBoundaries;
+          const isParaLastLine = block.paraLines
+            ? (block.lineIndex === block.paraLines.length - 1)
+            : true;
+          const isLastLine = Boolean(paraBoundaries ? paraBoundaries.isLastLine : isParaLastLine);
 
-          const fontStack = block.fontFamily === 'Times'
+          const isSelected = selectedBlockId === block.id;
+          const isSelectedParaMember = Boolean(
+            !isSelected &&
+            selectedObject?.isParagraphMember &&
+            selectedObject?.paraLines?.some((l) => l.id === block.id)
+          );
+
+          const effectiveBlock = currentEdit?.block || block;
+          const exactSize = (effectiveBlock.rawFontSize || effectiveBlock.fontSize || effectiveBlock.pdfFontSize || 12) * scale;
+          const isBold = effectiveBlock.isBold || effectiveBlock.fontWeight === 'bold';
+          const isItalic = effectiveBlock.isItalic || effectiveBlock.fontStyle === 'italic';
+
+          const currentFontFamily = effectiveBlock.fontFamily || 'Helvetica';
+          const fontStack = currentFontFamily === 'Times'
             ? '"Times New Roman", Times, Georgia, serif'
-            : block.fontFamily === 'Courier'
+            : currentFontFamily === 'Courier'
             ? '"Courier New", Courier, monospace'
             : '"Helvetica Neue", Helvetica, Arial, sans-serif';
 
+          const renderLeft = paraBoundaries
+            ? Math.round(paraBoundaries.left * scale)
+            : Math.round(block.screenLeft ?? block.left ?? 0);
+          const renderWidth = paraBoundaries
+            ? Math.round(paraBoundaries.width * scale)
+            : Math.round(block.screenWidth ?? block.width ?? 100);
+
+          const activeAlignment = selectedObject && (selectedBlockId === block.id || (selectedObject.isParagraphMember && selectedObject.paraLines?.some((l) => l.id === block.id)))
+            ? (selectedObject.textAlign || textAlign)
+            : textAlign;
+
+          const hasLink = Boolean(currentEdit?.linkUrl || block.linkUrl);
+          const linkUrl = currentEdit?.linkUrl || block.linkUrl || '';
+
           if (isEdited) {
+            const boxHeight = Math.max(
+              Math.round(exactSize * 1.092),
+              Math.round(block.screenHeight ?? block.height ?? (exactSize * 1.10))
+            );
+
             return (
               <div
                 key={`edited-${block.id}`}
                 className={`absolute box-border cursor-pointer pointer-events-auto select-none transition-all flex items-center ${
                   isSelected
                     ? 'border-2 border-blue-600 shadow-[0_0_0_2px_rgba(37,99,235,0.35)] z-28'
+                    : isSelectedParaMember
+                    ? 'border border-blue-500/70 bg-blue-500/10 shadow-[0_0_0_1px_rgba(37,99,235,0.25)] z-20'
+                    : hasLink
+                    ? 'border border-blue-500/50 hover:border-blue-500 shadow-[0_0_0_1px_rgba(37,99,235,0.2)] z-18 hover:z-26'
                     : 'border border-transparent hover:border-blue-500/70 hover:shadow-[0_0_0_2px_rgba(37,99,235,0.2)] z-18 hover:z-26'
                 }`}
                 style={{
-                  left: (block.screenLeft ?? block.left) - 1,
-                  top: (block.screenTop ?? block.top) - 2,
-                  minWidth: Math.max(block.screenWidth ?? block.width, (currentText.length * exactSize * 0.55) + 8),
-                  minHeight: (block.screenHeight ?? block.height) + 4,
-                  paddingLeft: '3px',
-                  paddingRight: '3px',
+                  left: renderLeft,
+                  top: Math.round(block.screenTop ?? block.top ?? 0),
+                  width: renderWidth,
+                  height: boxHeight,
+                  minHeight: boxHeight,
+                  paddingLeft: '0px',
+                  paddingRight: '0px',
                   fontSize: `${exactSize}px`,
                   fontFamily: fontStack,
                   fontWeight: isBold ? 700 : 400,
                   fontStyle: isItalic ? 'italic' : 'normal',
-                  color: block.fill || block.color || '#000000',
-                  backgroundColor: block.backgroundColor || '#ffffff',
-                  lineHeight: 1.15,
+                  color: effectiveBlock.fill || effectiveBlock.color || block.fill || block.color || '#000000',
+                  backgroundColor: effectiveBlock.backgroundColor || block.backgroundColor || '#ffffff',
+                  lineHeight: 1.09,
+                  letterSpacing: 'normal',
+                  overflow: 'hidden',
+                  whiteSpace: 'nowrap',
+                  justifyContent: activeAlignment === 'center' ? 'center' : activeAlignment === 'right' ? 'flex-end' : 'flex-start',
                 }}
-                title={`Click to edit: "${currentText.slice(0, 40)}"`}
+                title={hasLink ? `Hyperlink: "${linkUrl}" | Click to edit` : (isSelectedParaMember ? `Paragraph member: "${currentText.slice(0, 40)}"` : `Click to edit: "${currentText.slice(0, 40)}"`)}
                 onClick={(e) => {
                   e.stopPropagation();
                   if (typeof onSelectContentBlock === 'function') {
@@ -399,8 +650,121 @@ export function PdfPage({
                   }
                 }}
               >
-                <span>{currentText}</span>
-                {!isSelected && (
+                {/* Floating Contextual Toolbar for Selected Block */}
+                {isSelected && (
+                  <div
+                    className="absolute -top-9 left-0 flex items-center bg-slate-900/95 border border-slate-700/80 rounded-lg p-0.5 shadow-xl backdrop-blur-md z-30 pointer-events-auto gap-1"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="flex items-center gap-0.5">
+                      <button
+                        type="button"
+                        className={`p-1 rounded-md transition-colors ${
+                          activeAlignment === 'left' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-400 hover:text-white hover:bg-slate-800'
+                        }`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onApplyAlignment?.('left');
+                        }}
+                        title="Align Left"
+                      >
+                        <AlignLeft size={13} />
+                      </button>
+                      <button
+                        type="button"
+                        className={`p-1 rounded-md transition-colors ${
+                          activeAlignment === 'center' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-400 hover:text-white hover:bg-slate-800'
+                        }`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onApplyAlignment?.('center');
+                        }}
+                        title="Align Center"
+                      >
+                        <AlignCenter size={13} />
+                      </button>
+                      <button
+                        type="button"
+                        className={`p-1 rounded-md transition-colors ${
+                          activeAlignment === 'right' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-400 hover:text-white hover:bg-slate-800'
+                        }`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onApplyAlignment?.('right');
+                        }}
+                        title="Align Right"
+                      >
+                        <AlignRight size={13} />
+                      </button>
+                      <button
+                        type="button"
+                        className={`p-1 rounded-md transition-colors ${
+                          activeAlignment === 'justify' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-400 hover:text-white hover:bg-slate-800'
+                        }`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onApplyAlignment?.('justify');
+                        }}
+                        title="Justify"
+                      >
+                        <AlignJustify size={13} />
+                      </button>
+                    </div>
+
+                    {(selectedObject?.linkUrl || hasLink) && (
+                      <div className="flex items-center gap-1 px-1.5 py-0.5 text-[10px] text-blue-300 bg-blue-950/80 rounded border border-blue-500/40">
+                        <Link size={10} className="text-blue-400" />
+                        <span className="max-w-[120px] truncate">{selectedObject?.linkUrl || linkUrl}</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {activeAlignment === 'justify' && !isLastLine ? (() => {
+                  const justResult = computeJustifiedGap(
+                    currentText,
+                    renderWidth,
+                    exactSize,
+                    fontStack,
+                    isBold,
+                    isItalic
+                  );
+                  return (
+                    <div
+                      className="flex items-center justify-start pointer-events-none"
+                      style={{ gap: `${justResult.gap}px` }}
+                    >
+                      {justResult.words.map((w, wIdx) => (
+                        <span key={wIdx}>{w}</span>
+                      ))}
+                    </div>
+                  );
+                })() : (
+                  <span
+                    className={`w-full pointer-events-none ${
+                      activeAlignment === 'center'
+                        ? 'text-center'
+                        : activeAlignment === 'right'
+                        ? 'text-right'
+                        : 'text-left'
+                    }`}
+                    style={{ wordSpacing: 'normal' }}
+                  >
+                    {currentText || '\u00A0'}
+                  </span>
+                )}
+
+                {hasLink && (
+                  <span
+                    className="absolute -bottom-3 right-0 inline-flex items-center gap-0.5 text-[8px] font-semibold text-blue-300 bg-blue-950/95 border border-blue-500/50 rounded px-1 py-px shadow-xs pointer-events-none z-10"
+                    title={`Link: ${linkUrl}`}
+                  >
+                    <Link size={8} className="text-blue-400" />
+                    <span>Link</span>
+                  </span>
+                )}
+
+                {!isSelected && !isSelectedParaMember && (
                   <span className="absolute -top-3.5 -right-0.5 text-[9px] font-semibold text-white bg-blue-600 rounded px-1 py-px shadow-xs opacity-0 hover:opacity-100 group-hover:opacity-100 pointer-events-none transition-opacity whitespace-nowrap">
                     ✎ Edit
                   </span>
@@ -415,6 +779,10 @@ export function PdfPage({
               className={`absolute rounded-xs cursor-pointer box-border transition-all select-none group ${
                 isSelected
                   ? 'border-2 border-blue-600 bg-blue-600/15 shadow-[0_0_0_2px_rgba(37,99,235,0.35)] z-28'
+                  : isSelectedParaMember
+                  ? 'border border-solid border-blue-500/70 bg-blue-500/15 shadow-[0_0_0_1px_rgba(37,99,235,0.25)] z-20'
+                  : hasLink
+                  ? 'border border-solid border-blue-500/60 bg-blue-500/10 shadow-[0_0_0_1px_rgba(37,99,235,0.25)] z-16 hover:z-25'
                   : 'border border-dashed border-blue-500/40 bg-blue-500/5 hover:bg-blue-500/15 hover:border-blue-500 hover:border-solid hover:shadow-[0_0_0_2px_rgba(37,99,235,0.25)] z-14 hover:z-25'
               }`}
               style={{
@@ -423,7 +791,7 @@ export function PdfPage({
                 width: block.screenWidth ?? block.width,
                 height: (block.screenHeight ?? block.height) + 4,
               }}
-              title={`Click to edit content in right panel: "${block.str.slice(0, 35)}"`}
+              title={hasLink ? `Hyperlink: "${linkUrl}" | Click to edit` : (isSelectedParaMember ? `Paragraph member: "${block.str.slice(0, 35)}"` : `Click to edit content in right panel: "${block.str.slice(0, 35)}"`)}
               onClick={(e) => {
                 e.stopPropagation();
                 if (typeof onSelectContentBlock === 'function') {
@@ -431,7 +799,87 @@ export function PdfPage({
                 }
               }}
             >
-              {!isSelected && (
+              {/* Floating Contextual Toolbar for Selected Unedited Block */}
+              {isSelected && (
+                <div
+                  className="absolute -top-9 left-0 flex items-center bg-slate-900/95 border border-slate-700/80 rounded-lg p-0.5 shadow-xl backdrop-blur-md z-30 pointer-events-auto gap-1"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <div className="flex items-center gap-0.5">
+                    <button
+                      type="button"
+                      className={`p-1 rounded-md transition-colors ${
+                        activeAlignment === 'left' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-400 hover:text-white hover:bg-slate-800'
+                      }`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onApplyAlignment?.('left');
+                      }}
+                      title="Align Left"
+                    >
+                      <AlignLeft size={13} />
+                    </button>
+                    <button
+                      type="button"
+                      className={`p-1 rounded-md transition-colors ${
+                        activeAlignment === 'center' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-400 hover:text-white hover:bg-slate-800'
+                      }`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onApplyAlignment?.('center');
+                      }}
+                      title="Align Center"
+                    >
+                      <AlignCenter size={13} />
+                    </button>
+                    <button
+                      type="button"
+                      className={`p-1 rounded-md transition-colors ${
+                        activeAlignment === 'right' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-400 hover:text-white hover:bg-slate-800'
+                      }`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onApplyAlignment?.('right');
+                      }}
+                      title="Align Right"
+                    >
+                      <AlignRight size={13} />
+                    </button>
+                    <button
+                      type="button"
+                      className={`p-1 rounded-md transition-colors ${
+                        activeAlignment === 'justify' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-400 hover:text-white hover:bg-slate-800'
+                      }`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onApplyAlignment?.('justify');
+                      }}
+                      title="Justify"
+                    >
+                      <AlignJustify size={13} />
+                    </button>
+                  </div>
+
+                  {(selectedObject?.linkUrl || hasLink) && (
+                    <div className="flex items-center gap-1 px-1.5 py-0.5 text-[10px] text-blue-300 bg-blue-950/80 rounded border border-blue-500/40">
+                      <Link size={10} className="text-blue-400" />
+                      <span className="max-w-[120px] truncate">{selectedObject?.linkUrl || linkUrl}</span>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {hasLink && (
+                <span
+                  className="absolute -bottom-3 right-0 inline-flex items-center gap-0.5 text-[8px] font-semibold text-blue-300 bg-blue-950/95 border border-blue-500/50 rounded px-1 py-px shadow-xs pointer-events-none z-10"
+                  title={`Link: ${linkUrl}`}
+                >
+                  <Link size={8} className="text-blue-400" />
+                  <span>Link</span>
+                </span>
+              )}
+
+              {!isSelected && !isSelectedParaMember && (
                 <span className="absolute -top-3.5 -right-0.5 text-[10px] font-semibold text-white bg-blue-600 rounded px-1 py-px shadow-xs opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity duration-150 whitespace-nowrap">
                   ✎ Edit
                 </span>

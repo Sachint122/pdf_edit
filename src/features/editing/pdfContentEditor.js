@@ -102,14 +102,42 @@ export function extractTextColorsFromOpList(opList, opsEnum = OPS) {
  */
 export function normalizeFontFamily(fontName = '', rawFontFamily = '', extraStr = '') {
   const lower = `${fontName} ${rawFontFamily} ${extraStr}`.toLowerCase();
-  if (lower.includes('sans') || lower.includes('arial') || lower.includes('helvetica')) {
+  if (
+    lower.includes('courier') ||
+    lower.includes('mono') ||
+    lower.includes('consolas') ||
+    lower.includes('menlo')
+  ) {
+    return 'Courier';
+  }
+  if (
+    lower.includes('sans') ||
+    lower.includes('arial') ||
+    lower.includes('helvetica') ||
+    lower.includes('calibri') ||
+    lower.includes('segoe') ||
+    lower.includes('tahoma') ||
+    lower.includes('verdana') ||
+    lower.includes('roboto') ||
+    lower.includes('inter')
+  ) {
     return 'Helvetica';
   }
-  if (lower.includes('times') || lower.includes('serif') || lower.includes('roman') || lower.includes('georgia')) {
+  if (
+    lower.includes('times') ||
+    lower.includes('serif') ||
+    lower.includes('roman') ||
+    lower.includes('georgia') ||
+    lower.includes('cambria') ||
+    lower.includes('garamond') ||
+    lower.includes('baskerville') ||
+    lower.includes('palatino') ||
+    lower.includes('bookman') ||
+    lower.includes('century') ||
+    lower.includes('minion') ||
+    lower.includes('stix')
+  ) {
     return 'Times';
-  }
-  if (lower.includes('courier') || lower.includes('mono') || lower.includes('consolas')) {
-    return 'Courier';
   }
   return 'Helvetica';
 }
@@ -304,109 +332,220 @@ export async function extractPageTextBlocks(pdfDoc, pageNumber, scale = 1.0, rot
       }
     }
 
-    // Step 2: Identify paragraph clusters among lines and link them
-    const paragraphGroups = [];
-    let currentPara = null;
-    const bulletRegex = /^([•\u2022\u25cf\u25cb\-*]|\d+[.)])\s+/;
-
-    for (let i = 0; i < lineBlocks.length; i++) {
-      const line = lineBlocks[i];
-
-      if (!currentPara) {
-        currentPara = {
-          id: `para-${pageNumber}-${paragraphGroups.length + 1}`,
-          lines: [line],
-          fontFamily: line.fontFamily,
-          rawFontSize: line.rawFontSize,
-          isBold: line.isBold,
-          isItalic: line.isItalic,
-          baseVx: line.baseVx,
-          baseVy: line.baseVy,
-        };
-        continue;
-      }
-
-      const prevLine = currentPara.lines[currentPara.lines.length - 1];
-
-      // Criteria for belonging to the same paragraph:
-      const sameFont = line.fontFamily === prevLine.fontFamily && line.isBold === prevLine.isBold && line.isItalic === prevLine.isItalic;
-      const sameSize = Math.abs(line.rawFontSize - prevLine.rawFontSize) <= 1.2;
-      const verticalGap = line.baseVy - prevLine.baseVy;
-      const validLineGap = verticalGap >= prevLine.rawFontSize * 0.85 && verticalGap <= prevLine.rawFontSize * 1.85;
-      const sameLeftMargin = Math.abs(line.baseVx - currentPara.baseVx) <= Math.max(6, prevLine.rawFontSize * 0.8);
-      const isHangingIndent = line.baseVx >= currentPara.baseVx && (line.baseVx - currentPara.baseVx) <= 28;
-      const validIndent = sameLeftMargin || isHangingIndent;
-      const isNewBullet = bulletRegex.test(line.str.trim());
-
-      if (sameFont && sameSize && validLineGap && validIndent && !isNewBullet) {
-        currentPara.lines.push(line);
-      } else {
-        paragraphGroups.push(currentPara);
-        currentPara = {
-          id: `para-${pageNumber}-${paragraphGroups.length + 1}`,
-          lines: [line],
-          fontFamily: line.fontFamily,
-          rawFontSize: line.rawFontSize,
-          isBold: line.isBold,
-          isItalic: line.isItalic,
-          baseVx: line.baseVx,
-          baseVy: line.baseVy,
-        };
-      }
-    }
-
-    if (currentPara) {
-      paragraphGroups.push(currentPara);
-    }
-
-    // Step 3: Return lines as independent selectable blocks, enriched with paragraph metadata
-    const blocks = [];
-    let blockCounter = 1;
-
-    for (const group of paragraphGroups) {
-      const isMultiLinePara = group.lines.length > 1;
-
-      // Assign stable block IDs across all lines in this paragraph group
-      for (let idx = 0; idx < group.lines.length; idx++) {
-        group.lines[idx].id = `text-block-${pageNumber}-${blockCounter++}`;
-      }
-
-      const groupLinesRef = group.lines.map((l) => ({
-        id: l.id,
-        str: l.str,
-        rawWidth: l.rawWidth,
-        rawFontSize: l.rawFontSize,
-        ascent: l.ascent,
-        descent: l.descent,
-        pdfLeft: l.pdfLeft,
-        pdfTop: l.pdfTop,
-        pdfWidth: l.pdfWidth,
-        pdfHeight: l.pdfHeight,
-        baseVx: l.baseVx,
-        baseVy: l.baseVy,
-      }));
-
-      for (let idx = 0; idx < group.lines.length; idx++) {
-        const line = group.lines[idx];
-
-        blocks.push({
-          ...line,
-          isParagraph: false,
-          isParagraphMember: isMultiLinePara,
-          paraId: group.id,
-          lineIndex: idx,
-          paraLines: groupLinesRef,
-          originalStr: line.str,
-          lines: [{ ...line }],
-        });
-      }
-    }
-
-    return blocks;
+    // Step 2 & 3: Group lines into paragraphs and enrich with paragraph metadata
+    return clusterLinesIntoParagraphs(lineBlocks, pageNumber);
   } catch (err) {
     console.warn(`Could not extract text content for page ${pageNumber}:`, err);
     return [];
   }
+}
+
+/**
+ * Groups lines into paragraph clusters based on typography, vertical spacing, and alignment,
+ * and attaches full paragraph reflow metadata to each line.
+ *
+ * @param {Array<object>} lineBlocks - Individual text lines
+ * @param {number} [pageNumber=1] - 1-indexed page number
+ * @returns {Array<object>} - Line blocks enriched with isParagraphMember, paraId, paraLines
+ */
+export function clusterLinesIntoParagraphs(lineBlocks, pageNumber = 1) {
+  if (!Array.isArray(lineBlocks) || lineBlocks.length === 0) {
+    return [];
+  }
+
+  const paragraphGroups = [];
+  let currentPara = null;
+  const bulletRegex = /^([•\u2022\u25cf\u25cb\-*]|\d+[.)])\s+/;
+
+  const isSectionHeading = (str) => {
+    const trimmed = (str || '').trim();
+    if (trimmed.length < 2 || trimmed.length > 35) return false;
+    const hasLetters = /[A-Z]/.test(trimmed);
+    const hasNoLowercase = !/[a-z]/.test(trimmed);
+    return hasLetters && hasNoLowercase;
+  };
+
+  for (let i = 0; i < lineBlocks.length; i++) {
+    const line = lineBlocks[i];
+    const lineStr = (line.str || '').trim();
+    const isLineHeading = isSectionHeading(lineStr);
+
+    if (!currentPara) {
+      currentPara = {
+        id: `para-${pageNumber}-${paragraphGroups.length + 1}`,
+        lines: [line],
+        isHeading: isLineHeading,
+        fontFamily: line.fontFamily,
+        rawFontSize: line.rawFontSize,
+        isBold: line.isBold,
+        isItalic: line.isItalic,
+        baseVx: line.baseVx,
+        baseVy: line.baseVy,
+        tesseractParaId: line.tesseractParaId || null,
+      };
+      if (isLineHeading) {
+        paragraphGroups.push(currentPara);
+        currentPara = null;
+      }
+      continue;
+    }
+
+    const prevLine = currentPara.lines[currentPara.lines.length - 1];
+
+    if (isLineHeading) {
+      paragraphGroups.push(currentPara);
+      currentPara = {
+        id: `para-${pageNumber}-${paragraphGroups.length + 1}`,
+        lines: [line],
+        isHeading: true,
+        fontFamily: line.fontFamily,
+        rawFontSize: line.rawFontSize,
+        isBold: line.isBold,
+        isItalic: line.isItalic,
+        baseVx: line.baseVx,
+        baseVy: line.baseVy,
+        tesseractParaId: line.tesseractParaId || null,
+      };
+      paragraphGroups.push(currentPara);
+      currentPara = null;
+      continue;
+    }
+
+    const verticalGap = line.baseVy - prevLine.baseVy;
+    // Standard paragraph line spacing in documents is between 0.75x and 1.85x fontSize
+    const validLineGap = verticalGap >= prevLine.rawFontSize * 0.75 && verticalGap <= prevLine.rawFontSize * 1.85;
+
+    const sameFont = line.fontFamily === prevLine.fontFamily && line.isBold === prevLine.isBold && line.isItalic === prevLine.isItalic;
+    const sameSize = Math.abs(line.rawFontSize - prevLine.rawFontSize) <= Math.max(2.5, prevLine.rawFontSize * 0.2);
+    const sameLeftMargin = Math.abs(line.baseVx - currentPara.baseVx) <= Math.max(8, prevLine.rawFontSize * 0.9);
+    const isHangingIndent = line.baseVx >= currentPara.baseVx && (line.baseVx - currentPara.baseVx) <= 32;
+    const validIndent = sameLeftMargin || isHangingIndent;
+    const isNewBullet = bulletRegex.test(lineStr);
+    const isColonLabel = /^[^:\n]{2,35}\s*:/.test(lineStr) || /^:\s+/.test(lineStr);
+
+    const isSameTesseractPara = Boolean(
+      line.tesseractParaId &&
+      currentPara.tesseractParaId &&
+      line.tesseractParaId === currentPara.tesseractParaId
+    );
+
+    const canCluster =
+      !isNewBullet &&
+      !isColonLabel &&
+      (
+        (isSameTesseractPara && validLineGap) ||
+        (sameFont && sameSize && validLineGap && validIndent)
+      );
+
+    if (canCluster) {
+      currentPara.lines.push(line);
+    } else {
+      paragraphGroups.push(currentPara);
+      currentPara = {
+        id: `para-${pageNumber}-${paragraphGroups.length + 1}`,
+        lines: [line],
+        isHeading: isLineHeading,
+        fontFamily: line.fontFamily,
+        rawFontSize: line.rawFontSize,
+        isBold: line.isBold,
+        isItalic: line.isItalic,
+        baseVx: line.baseVx,
+        baseVy: line.baseVy,
+        tesseractParaId: line.tesseractParaId || null,
+      };
+      if (isLineHeading) {
+        paragraphGroups.push(currentPara);
+        currentPara = null;
+      }
+    }
+  }
+
+  if (currentPara) {
+    paragraphGroups.push(currentPara);
+  }
+
+  const blocks = [];
+  let blockCounter = 1;
+
+  for (const group of paragraphGroups) {
+    const isMultiLinePara = group.lines.length > 1;
+
+    // Harmonize typography across lines in the same paragraph cluster
+    // (Prevents ascenderless/descenderless lines from having mismatched font sizes)
+    const paraFontSizes = group.lines.map((l) => l.rawFontSize || l.fontSize || 12);
+    const fsFreq = {};
+    let dominantFontSize = paraFontSizes[0] || 12;
+    let maxFreq = 0;
+    for (const fs of paraFontSizes) {
+      fsFreq[fs] = (fsFreq[fs] || 0) + 1;
+      if (fsFreq[fs] > maxFreq) {
+        maxFreq = fsFreq[fs];
+        dominantFontSize = fs;
+      }
+    }
+
+    // Harmonize dominant font family, bold styling, and text color across paragraph
+    const dominantFont = group.lines.find((l) => l.fontFamily && l.fontFamily !== 'Helvetica')?.fontFamily || group.lines[0].fontFamily || 'Helvetica';
+    const dominantColor = group.lines.find((l) => l.fill && l.fill !== '#1e293b' && l.fill !== '#000000')?.fill || group.lines[0].fill || '#000000';
+    const dominantBold = group.lines.some((l) => l.isBold || l.fontWeight === 'bold');
+
+    for (let idx = 0; idx < group.lines.length; idx++) {
+      group.lines[idx].id = `text-block-${pageNumber}-${blockCounter++}`;
+      group.lines[idx].rawFontSize = dominantFontSize;
+      group.lines[idx].fontSize = dominantFontSize;
+      group.lines[idx].pdfFontSize = dominantFontSize;
+      if (dominantFont !== 'Helvetica') {
+        group.lines[idx].fontFamily = dominantFont;
+      }
+      group.lines[idx].fill = dominantColor;
+      group.lines[idx].color = dominantColor;
+      if (dominantBold) {
+        group.lines[idx].isBold = true;
+        group.lines[idx].fontWeight = 'bold';
+      }
+    }
+
+    const groupLinesRef = group.lines.map((l) => ({
+      id: l.id,
+      str: l.str,
+      rawWidth: l.rawWidth,
+      rawFontSize: l.rawFontSize,
+      ascent: l.ascent,
+      descent: l.descent,
+      pdfLeft: l.pdfLeft,
+      pdfTop: l.pdfTop,
+      pdfWidth: l.pdfWidth,
+      pdfHeight: l.pdfHeight,
+      baseVx: l.baseVx,
+      baseVy: l.baseVy,
+      fontFamily: l.fontFamily,
+      isBold: l.isBold,
+      isItalic: l.isItalic,
+      fontWeight: l.fontWeight,
+      fontStyle: l.fontStyle,
+      fill: l.fill,
+      color: l.color,
+      backgroundColor: l.backgroundColor,
+      originalStr: l.str,
+    }));
+
+    for (let idx = 0; idx < group.lines.length; idx++) {
+      const line = group.lines[idx];
+
+      blocks.push({
+        ...line,
+        isParagraph: false,
+        isParagraphMember: isMultiLinePara,
+        paraId: group.id,
+        lineIndex: idx,
+        paraLines: groupLinesRef,
+        originalStr: line.str,
+        lines: [{ ...line }],
+      });
+    }
+  }
+
+  return blocks;
 }
 
 /**
@@ -419,40 +558,58 @@ export async function extractPageTextBlocks(pdfDoc, pageNumber, scale = 1.0, rot
  * @param {object} [existingEdits={}] - Current content edits map for this page
  * @returns {Array<{ lineId: string, text: string, originalText: string, block: object }>}
  */
-export function reflowParagraphText(paraLines, editedLineId, newText, existingEdits = {}) {
+export function reflowParagraphText(paraLines, editedLineId, newText, existingEdits = {}, isFullParagraph = false) {
   if (!Array.isArray(paraLines) || paraLines.length === 0) {
     return [{ lineId: editedLineId, text: newText, originalText: newText }];
   }
 
-  // 1. Reconstruct composite paragraph text replacing the edited line's content
-  const fullTextParts = [];
-  for (const line of paraLines) {
-    if (line.id === editedLineId) {
-      if (newText && newText.trim().length > 0) {
-        fullTextParts.push(newText.trim());
-      }
-    } else {
-      const currentVal = existingEdits[line.id]?.text ?? line.str;
-      if (currentVal && currentVal.trim().length > 0) {
-        fullTextParts.push(currentVal.trim());
+  let combinedText = '';
+  if (isFullParagraph) {
+    combinedText = (newText || '').trim().replace(/\s+/g, ' ');
+  } else {
+    // Reconstruct composite paragraph text replacing the edited line's content
+    const fullTextParts = [];
+    for (const line of paraLines) {
+      if (line.id === editedLineId) {
+        if (newText && newText.trim().length > 0) {
+          fullTextParts.push(newText.trim());
+        }
+      } else {
+        const currentVal = existingEdits[line.id]?.text ?? line.str;
+        if (currentVal && currentVal.trim().length > 0) {
+          fullTextParts.push(currentVal.trim());
+        }
       }
     }
+    combinedText = fullTextParts.join(' ').replace(/\s+/g, ' ').trim();
   }
 
-  const combinedText = fullTextParts.join(' ').replace(/\s+/g, ' ').trim();
   const words = combinedText.length > 0 ? combinedText.split(' ') : [];
-
   const results = [];
   let wordIdx = 0;
+
+  // Compute maximum column width for this paragraph (usually lines 0 .. n-2 are full column width)
+  const nonLastLines = paraLines.slice(0, -1);
+  const maxLineWidth = nonLastLines.length > 0
+    ? Math.max(...nonLastLines.map((l) => l.rawWidth || 300))
+    : Math.max(...paraLines.map((l) => l.rawWidth || 300));
 
   for (let i = 0; i < paraLines.length; i++) {
     const line = paraLines[i];
     const isLastLine = i === paraLines.length - 1;
 
+    // Available width for this line: non-last lines use maxLineWidth so words pack nicely
+    const availableWidth = (!isLastLine || paraLines.length === 1)
+      ? maxLineWidth
+      : Math.max(line.rawWidth || 300, maxLineWidth * 0.85);
+
     // Approximate character capacity based on line's original width and character count
     const origLength = Math.max(10, (line.str || '').trim().length);
-    const avgCharWidth = (line.rawWidth || 300) / origLength;
-    const maxChars = Math.max(15, Math.floor((line.rawWidth || 300) / avgCharWidth));
+    const avgCharWidth = line.rawWidth > 0 && origLength > 0
+      ? (line.rawWidth / origLength)
+      : ((line.rawFontSize || 11) * 0.52);
+
+    const maxChars = Math.max(12, Math.floor(availableWidth / avgCharWidth));
 
     const currentLineWords = [];
     let currentLineLength = 0;
@@ -479,6 +636,12 @@ export function reflowParagraphText(paraLines, editedLineId, newText, existingEd
       originalText: line.str,
       block: line,
     });
+  }
+
+  // If there are words still remaining after the last line, append them to the last line
+  if (wordIdx < words.length && results.length > 0) {
+    const remaining = words.slice(wordIdx).join(' ');
+    results[results.length - 1].text += (results[results.length - 1].text ? ' ' : '') + remaining;
   }
 
   return results;

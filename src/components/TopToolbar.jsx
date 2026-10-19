@@ -44,7 +44,7 @@ export function TopToolbar({
   onSelectPage,
   onZoomChange,
   onFitWidth,
-  onFitPage,
+  _onFitPage,
   onOpenFile,
   onSelectTool,
   onAddImage,
@@ -54,8 +54,8 @@ export function TopToolbar({
   onOpenOrganizeModal,
   onOpenShortcutsModal,
 }) {
-  const replaceFileInputRef = useRef(null);
-  const imageFileInputRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const uploadModeRef = useRef('open'); // 'open' | 'insert'
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   const handlePrevPage = () => {
@@ -70,45 +70,38 @@ export function TopToolbar({
     }
   };
 
-  const handleZoomSelect = (e) => {
-    const val = e.target.value;
-    if (val === 'fit-width') {
-      onFitWidth();
-    } else if (val === 'fit-page') {
-      onFitPage();
-    } else {
-      onZoomChange(parseFloat(val));
-    }
-  };
-
   const triggerOpenNew = () => {
-    if (replaceFileInputRef.current) {
-      replaceFileInputRef.current.value = '';
-      replaceFileInputRef.current.click();
-    }
-  };
-
-  const handleNewFile = (e) => {
-    if (e.target.files && e.target.files.length > 0) {
-      onOpenFile(e.target.files[0]);
+    uploadModeRef.current = 'open';
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+      fileInputRef.current.click();
     }
   };
 
   const triggerImageUpload = () => {
-    if (imageFileInputRef.current) {
-      imageFileInputRef.current.value = '';
-      imageFileInputRef.current.click();
+    uploadModeRef.current = 'insert';
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+      fileInputRef.current.click();
     }
   };
 
-  const handleImageFileChange = (e) => {
+  const handleFileChange = (e) => {
     if (e.target.files && e.target.files.length > 0) {
       const file = e.target.files[0];
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        onAddImage(event.target.result);
-      };
-      reader.readAsDataURL(file);
+      const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+
+      if (uploadModeRef.current === 'insert' && !isPdf) {
+        // Insert image object onto canvas
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          onAddImage(event.target.result);
+        };
+        reader.readAsDataURL(file);
+      } else {
+        // Open document (PDF or Image with OCR text detection)
+        onOpenFile(file);
+      }
     }
   };
 
@@ -127,20 +120,13 @@ export function TopToolbar({
 
   return (
     <>
-      {/* Hidden File Inputs */}
+      {/* Single Unified Upload Input for PDF and Image */}
       <input
-        ref={replaceFileInputRef}
+        ref={fileInputRef}
         type="file"
-        accept="application/pdf,.pdf"
+        accept=".pdf,image/*"
         className="hidden"
-        onChange={handleNewFile}
-      />
-      <input
-        ref={imageFileInputRef}
-        type="file"
-        accept="image/png, image/jpeg, image/webp"
-        className="hidden"
-        onChange={handleImageFileChange}
+        onChange={handleFileChange}
       />
 
       {/* Main Top Header */}
@@ -226,25 +212,26 @@ export function TopToolbar({
         {/* Center Segment: Hero Floating Studio Tool Dock (Always Geometrically Centered) */}
         <div className="absolute left-1/2 -translate-x-1/2 hidden md:flex items-center gap-1 bg-slate-900/90 border border-slate-800/90 p-1 rounded-xl shadow-lg shadow-black/30 backdrop-blur-md z-20">
           {/* Edit Content Tool */}
-          <button
-            type="button"
-            className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors active:scale-98 ${activeTool === 'edit-content'
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors active:scale-98 ${activeTool === 'edit-content'
                 ? 'bg-blue-600 text-white shadow-xs shadow-blue-500/25'
                 : 'text-slate-300 hover:text-white hover:bg-slate-800/80'
-              }`}
-            onClick={() => onSelectTool('edit-content')}
-            title="Direct In-Place PDF Content Editor (Click on existing text lines to edit)"
-          >
-            <FileEdit size={14} />
-            <span>Edit Content</span>
-          </button>
-
+                }`}
+              onClick={() => onSelectTool('edit-content')}
+              title="Direct In-Place PDF Content Editor (Click on existing text lines to edit)"
+            >
+              <FileEdit size={14} />
+              <span>Edit Content</span>
+            </button>
+          </div>
           {/* Freehand Pen */}
           <button
             type="button"
             className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors active:scale-98 ${activeTool === 'pen'
-                ? 'bg-blue-600 text-white shadow-xs shadow-blue-500/25'
-                : 'text-slate-300 hover:text-white hover:bg-slate-800/80'
+              ? 'bg-blue-600 text-white shadow-xs shadow-blue-500/25'
+              : 'text-slate-300 hover:text-white hover:bg-slate-800/80'
               }`}
             onClick={() => onSelectTool(activeTool === 'pen' ? 'edit-content' : 'pen')}
             title="Freehand Drawing Pen Tool (P)"
@@ -331,7 +318,7 @@ export function TopToolbar({
               <ZoomOut size={13} />
             </button>
 
-            
+
 
             <button
               type="button"
@@ -537,8 +524,8 @@ export function TopToolbar({
                     setMobileMenuOpen(false);
                   }}
                   className={`flex items-center gap-3 p-3 rounded-2xl border text-left transition-all ${activeTool === 'edit-content'
-                      ? 'bg-blue-600/25 border-blue-500/60 text-white shadow-md shadow-blue-500/15'
-                      : 'bg-slate-800/60 border-slate-700/60 text-slate-300 hover:bg-slate-700/60'
+                    ? 'bg-blue-600/25 border-blue-500/60 text-white shadow-md shadow-blue-500/15'
+                    : 'bg-slate-800/60 border-slate-700/60 text-slate-300 hover:bg-slate-700/60'
                     }`}
                 >
                   <div className="w-9 h-9 rounded-xl bg-blue-500/20 text-blue-400 flex items-center justify-center flex-shrink-0">
@@ -558,8 +545,8 @@ export function TopToolbar({
                     setMobileMenuOpen(false);
                   }}
                   className={`flex items-center gap-3 p-3 rounded-2xl border text-left transition-all ${activeTool === 'pen'
-                      ? 'bg-indigo-600/25 border-indigo-500/60 text-white shadow-md shadow-indigo-500/15'
-                      : 'bg-slate-800/60 border-slate-700/60 text-slate-300 hover:bg-slate-700/60'
+                    ? 'bg-indigo-600/25 border-indigo-500/60 text-white shadow-md shadow-indigo-500/15'
+                    : 'bg-slate-800/60 border-slate-700/60 text-slate-300 hover:bg-slate-700/60'
                     }`}
                 >
                   <div className="w-9 h-9 rounded-xl bg-indigo-500/20 text-indigo-400 flex items-center justify-center flex-shrink-0">
@@ -608,6 +595,7 @@ export function TopToolbar({
                 </button>
               </div>
             </div>
+
 
             {/* Section 2: Navigation & Page Management */}
             <div className="flex flex-col gap-2">

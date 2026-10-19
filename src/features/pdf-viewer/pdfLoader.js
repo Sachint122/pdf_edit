@@ -93,7 +93,11 @@ export async function loadPdfDocument(data, options = {}) {
 export async function destroyPdfDocument(pdfDoc) {
   if (!pdfDoc) return;
   try {
-    await pdfDoc.destroy();
+    if (typeof pdfDoc.destroy === 'function') {
+      await pdfDoc.destroy();
+    } else if (typeof pdfDoc.cleanup === 'function') {
+      await pdfDoc.cleanup();
+    }
   } catch (err) {
     console.warn('Error during PDF document destruction:', err);
   }

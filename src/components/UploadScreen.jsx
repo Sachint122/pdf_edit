@@ -1,6 +1,7 @@
 /**
  * UploadScreen Component
- * Drag-and-drop file upload, file picker, and local sample loader.
+ * Single unified drag-and-drop file upload and picker for PDF and Images,
+ * with automatic OCR text detection and clean, simple user feedback.
  */
 
 import React, { useState, useRef, useCallback } from 'react';
@@ -10,7 +11,6 @@ import {
   Sparkles,
   ShieldCheck,
   Layers,
-  HardDrive,
   AlertCircle,
   X,
   Loader2,
@@ -20,6 +20,7 @@ export function UploadScreen({
   onFileSelect,
   onLoadSample,
   loading = false,
+  loadingMessage = '',
   error = null,
   onClearError,
 }) {
@@ -84,10 +85,10 @@ export function UploadScreen({
             <FileText size={26} />
           </div>
           <h1 className="text-2xl md:text-3xl font-extrabold text-white tracking-tight">
-            Frontend-Only PDF Editor
+            Frontend-Only PDF & Image Editor
           </h1>
           <p className="text-xs md:text-sm text-slate-400 max-w-md mx-auto leading-relaxed">
-            Open, inspect, and edit PDF documents locally in your browser with zero server uploads.
+            Open, inspect, and edit PDF documents and images locally in your browser with zero server uploads.
           </p>
         </div>
 
@@ -109,7 +110,7 @@ export function UploadScreen({
           </div>
         )}
 
-        {/* Dropzone Box */}
+        {/* Single Dropzone Box */}
         <div
           className={`w-full border-2 border-dashed rounded-2xl p-8 md:p-12 flex flex-col items-center justify-center gap-3 cursor-pointer transition-all duration-200 ${
             isDragOver
@@ -122,42 +123,48 @@ export function UploadScreen({
           onDrop={handleDrop}
           onClick={triggerFileBrowser}
         >
+          {/* Only ONE upload input for both PDF and Image files */}
           <input
             ref={fileInputRef}
             type="file"
-            accept="application/pdf,.pdf"
+            accept=".pdf,image/*"
             className="hidden"
             onChange={handleFileInputChange}
           />
 
           {loading ? (
-            <>
-              <Loader2 size={44} className="animate-spin text-blue-500" />
-              <div className="text-base font-bold text-white">Parsing PDF Document...</div>
-              <div className="text-xs text-slate-400">Analyzing pages and preparing local workspace</div>
-            </>
+            <div className="flex flex-col items-center justify-center py-2">
+              <Loader2 size={40} className="animate-spin text-blue-500 mb-3" />
+              <div className="text-base font-bold text-white mb-1">
+                {loadingMessage || 'Loading document...'}
+              </div>
+              <div className="text-xs text-slate-400">
+                Please wait a moment...
+              </div>
+            </div>
           ) : (
             <>
               <FileUp className="w-11 h-11 text-slate-400 mb-1" />
               <div className="text-base font-bold text-white">
-                Drag and drop your PDF here, or click to browse
+                Drag and drop your PDF or Image here, or click to browse
               </div>
               <div className="text-xs text-slate-400">
-                Supports standard PDF files up to 50 MB
+                Supports standard PDF documents and images (PNG, JPG, WebP)
               </div>
 
               <div className="flex items-center gap-3 mt-4 flex-wrap justify-center" onClick={(e) => e.stopPropagation()}>
                 <button
                   type="button"
-                  className="px-4 py-2 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white shadow-sm shadow-blue-600/25 active:scale-98 transition-all"
+                  className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white shadow-sm shadow-blue-600/25 active:scale-98 transition-all"
                   onClick={triggerFileBrowser}
                   disabled={loading}
                 >
-                  Browse PDF File
+                  <FileUp size={14} />
+                  <span>Upload PDF or Image</span>
                 </button>
                 <button
                   type="button"
-                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700/80 active:scale-98 transition-all"
+                  className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700/80 active:scale-98 transition-all"
                   onClick={onLoadSample}
                   disabled={loading}
                   title="Generate a local multi-page sample PDF"
@@ -178,7 +185,17 @@ export function UploadScreen({
               <span>100% Client-Side</span>
             </div>
             <div className="text-[11px] text-slate-400 leading-normal">
-              Zero backend or cloud storage. Files never leave your browser memory.
+              Zero backend or cloud storage. Files and OCR stay in your browser.
+            </div>
+          </div>
+
+          <div className="p-3.5 rounded-xl bg-slate-900/40 border border-white/[0.06] flex flex-col gap-1.5">
+            <div className="flex items-center gap-2 text-xs font-semibold text-white">
+              <Sparkles size={15} className="text-amber-400" />
+              <span>Text Detection (OCR)</span>
+            </div>
+            <div className="text-[11px] text-slate-400 leading-normal">
+              Automatically detects text in images so you can click, edit, and export.
             </div>
           </div>
 
@@ -191,18 +208,10 @@ export function UploadScreen({
               Accurate page previews, thumbnails, and high-DPR canvas scaling.
             </div>
           </div>
-
-          <div className="p-3.5 rounded-xl bg-slate-900/40 border border-white/[0.06] flex flex-col gap-1.5">
-            <div className="flex items-center gap-2 text-xs font-semibold text-white">
-              <HardDrive size={15} className="text-blue-400" />
-              <span>50 MB Limit</span>
-            </div>
-            <div className="text-[11px] text-slate-400 leading-normal">
-              Handles standard contracts, reports, and multi-page forms.
-            </div>
-          </div>
         </div>
       </div>
     </div>
   );
 }
+
+export default UploadScreen;

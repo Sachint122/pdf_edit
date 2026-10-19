@@ -36,6 +36,9 @@ import { MergePdfModal } from './MergePdfModal.jsx';
 import { OrganizePagesModal } from './OrganizePagesModal.jsx';
 import { KeyboardShortcutsModal } from './KeyboardShortcutsModal.jsx';
 import { DEFAULT_WATERMARK_CONFIG, DEFAULT_PAGE_NUMBER_CONFIG } from '../features/advanced/watermarkManager.js';
+import { reflowParagraphText } from '../features/editing/pdfContentEditor.js';
+import { Textbox } from 'fabric';
+import { runOcrOnFile } from '../utils/ocr.js';
 
 export function EditorLayout({
   pdfDoc,
@@ -43,6 +46,7 @@ export function EditorLayout({
   rawBuffer,
   pagesMeta = [],
   onOpenFile,
+  initialOcrBlocks = null,
 }) {
   // Document Pages State with stable IDs
   const [pages, setPages] = useState(() => initializePagesState(pagesMeta));
@@ -119,6 +123,7 @@ export function EditorLayout({
       [pageId]: json,
     }));
   }, []);
+
 
   // Selection handlers
   const handleObjectSelected = useCallback((pageId, props, canvasInstance) => {
@@ -438,62 +443,345 @@ export function EditorLayout({
     }
   }, [pages, pageEdits, recordChange]);
 
+  // 8. OCR Image handler: scans selected canvas image and adds editable textboxes
+  const handleOcrImage = useCallback(async () => {
+    const canvas = selectedCanvasRef.current;
+    if (!canvas) return;
+    const activeObj = canvas.getActiveObject();
+    if (!activeObj) return;
+
+    let imgSrc = activeObj._element?.src || activeObj.src;
+    if (!imgSrc && typeof activeObj.toDataURL === 'function') {
+      try {
+        imgSrc = activeObj.toDataURL();
+      } catch (e) {
+        console.warn('Could not extract data URL from image object:', e);
+      }
+    }
+    if (!imgSrc) {
+      throw new Error('Could not access image data for OCR.');
+    }
+
+    const activePageObj = pages[activePage - 1] || pages[0];
+    const pageHeight = activePageObj?.height || 792;
+
+    const ocrResult = await runOcrOnFile(imgSrc, {
+      pageHeightPt: pageHeight,
+    });
+
+    if (!ocrResult.success || !ocrResult.lines || ocrResult.lines.length === 0) {
+      throw new Error(ocrResult.error || 'No readable text was detected in this image.');
+    }
+
+    recordChange({ pages, pageEdits });
+
+    const imgLeft = activeObj.left || 0;
+    const imgTop = activeObj.top || 0;
+    const sX = activeObj.scaleX || 1;
+    const sY = activeObj.scaleY || 1;
+
+    let firstCreatedTb = null;
+
+    for (const line of ocrResult.lines) {
+      if (!line.bbox) continue;
+      const tbLeft = imgLeft + line.bbox.x0 * sX;
+      const tbTop = imgTop + line.bbox.y0 * sY;
+      const tbWidth = Math.max(20, (line.bbox.x1 - line.bbox.x0) * sX);
+      const tbHeight = Math.max(12, (line.bbox.y1 - line.bbox.y0) * sY);
+      const fontSize = Math.max(9, Math.round(tbHeight * 0.82));
+
+      const tb = new Textbox(line.text, {
+        left: tbLeft,
+        top: tbTop,
+        width: tbWidth,
+        fontSize,
+        fontFamily: 'Helvetica',
+        fill: '#1e293b',
+        backgroundColor: '#ffffff',
+        padding: 2,
+        borderColor: '#3b82f6',
+        cornerColor: '#3b82f6',
+        cornerSize: 8,
+        transparentCorners: false,
+      });
+
+      canvas.add(tb);
+      if (!firstCreatedTb) {
+        firstCreatedTb = tb;
+      }
+    }
+
+    if (firstCreatedTb) {
+      canvas.setActiveObject(firstCreatedTb);
+      setSelectedObjectProps(extractObjectProperties(firstCreatedTb));
+    }
+    canvas.renderAll();
+  }, [pages, pageEdits, activePage, recordChange]);
+
   // ==========================================
   // DIRECT PDF CONTENT EDIT HANDLERS
   // ==========================================
 
-  // Select a text block on any page
+  // Select a text block on any page (with unified paragraph clustering & reflow support)
   const handleSelectContentBlock = useCallback((pageId, pageNumber, block, currentText) => {
+    const isPara = Boolean(block.isParagraphMember && Array.isArray(block.paraLines) && block.paraLines.length > 1);
+
+    let initialText = currentText;
+    let initialOriginalText = block.originalStr || block.str;
+    const currentEdits = pageEdits[pageId]?.contentEdits || {};
+    const initialAlign = currentEdits[block.id]?.textAlign || block.textAlign || 'left';
+    const initialLinkUrl = currentEdits[block.id]?.linkUrl || block.linkUrl || '';
+
+    if (isPara) {
+      const paraTexts = block.paraLines.map((line) => {
+        if (currentEdits[line.id] !== undefined) {
+          return currentEdits[line.id].text;
+        }
+        return line.originalStr || line.str;
+      });
+      initialText = paraTexts.filter((t) => t !== undefined && t !== null).join(' ').replace(/\s+/g, ' ').trim();
+      initialOriginalText = block.paraLines.map((l) => l.originalStr || l.str).filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+    }
+
+    const effectiveBlock = currentEdits[block.id]?.block || block;
+    const effectiveParaLines = (block.paraLines || []).map((line) => {
+      return currentEdits[line.id]?.block || {
+        ...line,
+        fill: effectiveBlock.fill || effectiveBlock.color || line.fill || line.color || '#000000',
+        color: effectiveBlock.color || effectiveBlock.fill || line.color || line.fill || '#000000',
+        backgroundColor: effectiveBlock.backgroundColor || line.backgroundColor || '#ffffff',
+        fontFamily: effectiveBlock.fontFamily || line.fontFamily || 'Helvetica',
+        fontSize: effectiveBlock.rawFontSize || line.rawFontSize || 12,
+        rawFontSize: effectiveBlock.rawFontSize || line.rawFontSize || 12,
+        isBold: effectiveBlock.isBold ?? line.isBold ?? false,
+        isItalic: effectiveBlock.isItalic ?? line.isItalic ?? false,
+        fontWeight: effectiveBlock.fontWeight || line.fontWeight || 'normal',
+        fontStyle: effectiveBlock.fontStyle || line.fontStyle || 'normal',
+      };
+    });
+
     setSelectedObjectProps({
       type: 'textbox',
       isPdfContentEdit: true,
       pageId,
       pageNumber,
       blockId: block.id,
-      text: currentText,
-      originalText: block.originalStr || block.str,
-      block,
-      fill: block.fill || block.color || '#000000',
-      backgroundColor: block.backgroundColor || '#ffffff',
-      fontSize: block.rawFontSize || block.fontSize || 12,
-      fontFamily: block.fontFamily || 'Helvetica',
-      fontWeight: block.fontWeight || (block.isBold ? 'bold' : 'normal'),
-      fontStyle: block.fontStyle || (block.isItalic ? 'italic' : 'normal'),
+      paraId: block.paraId,
+      isParagraphMember: isPara,
+      paraLines: effectiveParaLines,
+      lineText: currentText,
+      text: initialText,
+      originalText: initialOriginalText,
+      block: effectiveBlock,
+      fill: effectiveBlock.fill || effectiveBlock.color || '#000000',
+      backgroundColor: effectiveBlock.backgroundColor || '#ffffff',
+      fontSize: effectiveBlock.rawFontSize || effectiveBlock.fontSize || 12,
+      fontFamily: effectiveBlock.fontFamily || 'Helvetica',
+      fontWeight: effectiveBlock.fontWeight || (effectiveBlock.isBold ? 'bold' : 'normal'),
+      fontStyle: effectiveBlock.fontStyle || (effectiveBlock.isItalic ? 'italic' : 'normal'),
+      textAlign: initialAlign,
+      linkUrl: initialLinkUrl,
     });
     const index = pages.findIndex((p) => p.id === pageId);
     if (index !== -1) {
       setActivePage(index + 1);
     }
-  }, [pages]);
+  }, [pages, pageEdits]);
 
-  // Save modified text content for a PDF block with exact font style, size, color, and layout preservation
-  const handleSaveContentEdit = useCallback((selectedObj, newText, customColor) => {
-    const { pageId, blockId, block, originalText } = selectedObj;
+  // Apply text alignment (left, center, right, justify) to selected text block or paragraph
+  const handleApplyAlignment = useCallback((align, scope = 'paragraph') => {
+    if (!selectedObjectProps) return;
+
+    // A. Standard Fabric Canvas Textbox
+    if (!selectedObjectProps.isPdfContentEdit) {
+      const canvas = selectedCanvasRef.current;
+      if (!canvas) return;
+      const activeObj = canvas.getActiveObject();
+      if (!activeObj) return;
+
+      recordChange({ pages, pageEdits });
+      activeObj.set('textAlign', align);
+      canvas.renderAll();
+
+      setSelectedObjectProps((prev) => ({
+        ...prev,
+        textAlign: align,
+      }));
+      return;
+    }
+
+    // B. Direct in-place PDF content block or paragraph
+    const { pageId, blockId, block } = selectedObjectProps;
     if (!pageId || !blockId || !block) return;
 
     recordChange({ pages, pageEdits });
+
+    const isPara = scope === 'paragraph' && Boolean(
+      selectedObjectProps.isParagraphMember &&
+      Array.isArray(selectedObjectProps.paraLines) &&
+      selectedObjectProps.paraLines.length > 1
+    );
 
     const exactFontSize = block.rawFontSize || block.fontSize || block.pdfFontSize || 12;
     const exactFontFamily = block.fontFamily || 'Helvetica';
     const exactFontWeight = block.fontWeight || (block.isBold ? 'bold' : 'normal');
     const exactFontStyle = block.fontStyle || (block.isItalic ? 'italic' : 'normal');
-    const exactColor = customColor || selectedObj.fill || block.fill || block.color || '#000000';
-    const exactBg = selectedObj.backgroundColor || block.backgroundColor || '#ffffff';
+    const exactColor = selectedObjectProps.fill || block.fill || block.color || '#000000';
+    const exactBg = selectedObjectProps.backgroundColor || block.backgroundColor || '#ffffff';
 
     setPageEdits((prev) => {
       const prevPageData = prev[pageId] || { version: '6.0.0', objects: [] };
       const currentContentEdits = { ...(prevPageData.contentEdits || {}) };
 
+      if (isPara) {
+        const lines = selectedObjectProps.paraLines;
+        const pLeft = Math.min(...lines.map((l) => (Number.isFinite(l.pdfLeft) ? l.pdfLeft : (l.baseVx ?? 0))));
+        const pRight = Math.max(...lines.map((l) => {
+          const lLeft = Number.isFinite(l.pdfLeft) ? l.pdfLeft : (l.baseVx ?? 0);
+          const lWidth = Number.isFinite(l.pdfWidth) ? l.pdfWidth : (l.rawWidth ?? 100);
+          return lLeft + lWidth;
+        }));
+        const pWidth = Math.max(20, pRight - pLeft);
+
+        const paraLineIds = new Set(lines.map((l) => l.id));
+        const filteredObjects = (prevPageData.objects || []).filter(
+          (o) => !paraLineIds.has(o.originalBlockId)
+        );
+
+        const newExportObjects = [];
+
+        for (let idx = 0; idx < lines.length; idx++) {
+          const l = lines[idx];
+          const isLastLine = idx === lines.length - 1;
+          const lText = currentContentEdits[l.id]?.text ?? l.str ?? '';
+
+          currentContentEdits[l.id] = {
+            text: lText,
+            originalText: l.originalStr || l.str,
+            textAlign: align,
+            paraBoundaries: {
+              left: pLeft,
+              right: pRight,
+              width: pWidth,
+              isLastLine,
+            },
+            block: {
+              ...(currentContentEdits[l.id]?.block || l),
+              str: lText,
+              textAlign: align,
+              fontSize: exactFontSize,
+              rawFontSize: exactFontSize,
+              fontFamily: exactFontFamily,
+              fontWeight: exactFontWeight,
+              fontStyle: exactFontStyle,
+              fill: exactColor,
+              color: exactColor,
+              backgroundColor: exactBg,
+              paraBoundaries: {
+                left: pLeft,
+                right: pRight,
+                width: pWidth,
+                isLastLine,
+              },
+            },
+          };
+
+          newExportObjects.push({
+            type: 'textbox',
+            text: lText,
+            left: pLeft,
+            top: l.pdfTop,
+            width: pWidth,
+            height: l.pdfHeight || l.height,
+            fontSize: exactFontSize,
+            fontFamily: exactFontFamily,
+            fontWeight: exactFontWeight,
+            fontStyle: exactFontStyle,
+            fill: exactColor,
+            backgroundColor: exactBg,
+            padding: 0,
+            isPdfContentEdit: true,
+            textAlign: align,
+            originalBlockId: l.id,
+            linesInfo: [{
+              pdfLeft: l.pdfLeft,
+              pdfTop: l.pdfTop,
+              pdfX: l.baseVx ?? l.pdfX,
+              pdfWidth: l.pdfWidth || l.rawWidth,
+              pdfHeight: l.pdfHeight,
+              rawFontSize: exactFontSize,
+              baseVy: l.baseVy,
+              paraLeft: pLeft,
+              paraRight: pRight,
+              paraWidth: pWidth,
+              isLastLine,
+            }],
+            originalPdfCoords: {
+              x: l.pdfX,
+              y: l.pdfY,
+              width: l.rawWidth,
+              height: l.pdfHeightVal,
+              fontSize: exactFontSize,
+            },
+          });
+        }
+
+        return {
+          ...prev,
+          [pageId]: {
+            ...prevPageData,
+            contentEdits: currentContentEdits,
+            objects: [...filteredObjects, ...newExportObjects],
+          },
+        };
+      }
+
+      // Single line block
+      const bLeft = Number.isFinite(block.pdfLeft) ? block.pdfLeft : (block.left ?? 0);
+      const bWidth = Number.isFinite(block.pdfWidth) ? block.pdfWidth : (block.width ?? 100);
+      const curText = currentContentEdits[blockId]?.text ?? block.str ?? '';
+
       const filteredObjects = (prevPageData.objects || []).filter(
         (o) => o.originalBlockId !== blockId
       );
 
+      currentContentEdits[blockId] = {
+        text: curText,
+        originalText: selectedObjectProps.originalText || block.str,
+        textAlign: align,
+        paraBoundaries: {
+          left: bLeft,
+          right: bLeft + bWidth,
+          width: bWidth,
+          isLastLine: true,
+        },
+        block: {
+          ...(currentContentEdits[blockId]?.block || block),
+          str: curText,
+          textAlign: align,
+          fontSize: exactFontSize,
+          rawFontSize: exactFontSize,
+          fontFamily: exactFontFamily,
+          fontWeight: exactFontWeight,
+          fontStyle: exactFontStyle,
+          fill: exactColor,
+          color: exactColor,
+          backgroundColor: exactBg,
+          paraBoundaries: {
+            left: bLeft,
+            right: bLeft + bWidth,
+            width: bWidth,
+            isLastLine: true,
+          },
+        },
+      };
+
       const exportObj = {
         type: 'textbox',
-        text: newText,
-        left: block.pdfLeft,
+        text: curText,
+        left: bLeft,
         top: block.pdfTop,
-        width: block.pdfWidth || block.width,
+        width: bWidth,
         height: block.pdfHeight || block.height,
         fontSize: exactFontSize,
         fontFamily: exactFontFamily,
@@ -503,6 +791,7 @@ export function EditorLayout({
         backgroundColor: exactBg,
         padding: 0,
         isPdfContentEdit: true,
+        textAlign: align,
         originalBlockId: blockId,
         linesInfo: [{
           pdfLeft: block.pdfLeft,
@@ -512,6 +801,233 @@ export function EditorLayout({
           pdfHeight: block.pdfHeight,
           rawFontSize: exactFontSize,
           baseVy: block.baseVy,
+          paraLeft: bLeft,
+          paraRight: bLeft + bWidth,
+          paraWidth: bWidth,
+          isLastLine: true,
+        }],
+        originalPdfCoords: {
+          x: block.pdfX,
+          y: block.pdfY,
+          width: block.rawWidth,
+          height: block.pdfHeightVal,
+          fontSize: exactFontSize,
+        },
+      };
+
+      return {
+        ...prev,
+        [pageId]: {
+          ...prevPageData,
+          contentEdits: currentContentEdits,
+          objects: [...filteredObjects, exportObj],
+        },
+      };
+    });
+
+    setSelectedObjectProps((prev) => (prev ? { ...prev, textAlign: align } : null));
+  }, [selectedObjectProps, pages, pageEdits, recordChange]);
+
+  // Save modified text content for a PDF block with exact font style, size, color, and layout preservation
+  const handleSaveContentEdit = useCallback((
+    selectedObj,
+    newText,
+    customColor,
+    scope = 'paragraph',
+    customAlign,
+    customLinkUrl,
+    customFontSize,
+    customFontFamily,
+    customBold,
+    customItalic
+  ) => {
+    const { pageId, blockId, block, originalText } = selectedObj;
+    if (!pageId || !blockId || !block) return;
+
+    recordChange({ pages, pageEdits });
+
+    const exactFontSize = customFontSize !== undefined
+      ? customFontSize
+      : (block.rawFontSize || block.fontSize || block.pdfFontSize || 12);
+    const exactFontFamily = customFontFamily !== undefined
+      ? customFontFamily
+      : (block.fontFamily || 'Helvetica');
+    const exactFontWeight = customBold !== undefined
+      ? (customBold ? 'bold' : 'normal')
+      : (block.fontWeight || (block.isBold ? 'bold' : 'normal'));
+    const exactFontStyle = customItalic !== undefined
+      ? (customItalic ? 'italic' : 'normal')
+      : (block.fontStyle || (block.isItalic ? 'italic' : 'normal'));
+    const exactColor = customColor || selectedObj.fill || block.fill || block.color || '#000000';
+    const exactBg = selectedObj.backgroundColor || block.backgroundColor || '#ffffff';
+    const exactAlign = customAlign || selectedObj.textAlign || 'left';
+    const exactLinkUrl = customLinkUrl !== undefined ? customLinkUrl : (selectedObj.linkUrl || '');
+    const isTextUnmodified = (newText === originalText) && (exactColor === (selectedObj.fill || block.fill || block.color || '#000000'));
+    const isLinkOnly = isTextUnmodified && Boolean(exactLinkUrl && exactLinkUrl.trim().length > 0);
+
+    const isPara = scope === 'paragraph' && Boolean(selectedObj.isParagraphMember && Array.isArray(selectedObj.paraLines) && selectedObj.paraLines.length > 1);
+
+    setPageEdits((prev) => {
+      const prevPageData = prev[pageId] || { version: '6.0.0', objects: [] };
+      const currentContentEdits = { ...(prevPageData.contentEdits || {}) };
+
+      if (isPara) {
+        // Reflow the full paragraph text across all constituent lines
+        const reflowed = reflowParagraphText(
+          selectedObj.paraLines,
+          selectedObj.blockId,
+          newText,
+          currentContentEdits,
+          true // isFullParagraph = true
+        );
+
+        const lines = selectedObj.paraLines;
+        const pLeft = Math.min(...lines.map((l) => (Number.isFinite(l.pdfLeft) ? l.pdfLeft : (l.baseVx ?? 0))));
+        const pRight = Math.max(...lines.map((l) => {
+          const lLeft = Number.isFinite(l.pdfLeft) ? l.pdfLeft : (l.baseVx ?? 0);
+          const lWidth = Number.isFinite(l.pdfWidth) ? l.pdfWidth : (l.rawWidth ?? 100);
+          return lLeft + lWidth;
+        }));
+        const pWidth = Math.max(20, pRight - pLeft);
+
+        const paraLineIds = new Set(selectedObj.paraLines.map((l) => l.id));
+        const filteredObjects = (prevPageData.objects || []).filter(
+          (o) => !paraLineIds.has(o.originalBlockId)
+        );
+        const newExportObjects = [];
+
+        for (let idx = 0; idx < reflowed.length; idx++) {
+          const item = reflowed[idx];
+          const lBlock = item.block;
+          const lId = item.lineId;
+          const lText = item.text || '';
+          const isLastLine = idx === reflowed.length - 1;
+
+          currentContentEdits[lId] = {
+            text: lText,
+            originalText: item.originalText || lBlock.str,
+            textAlign: exactAlign,
+            linkUrl: exactLinkUrl,
+            isLinkOnly,
+            paraBoundaries: {
+              left: pLeft,
+              right: pRight,
+              width: pWidth,
+              isLastLine,
+            },
+            block: {
+              ...lBlock,
+              str: lText,
+              textAlign: exactAlign,
+              fontSize: exactFontSize,
+              rawFontSize: exactFontSize,
+              fontFamily: exactFontFamily,
+              fontWeight: exactFontWeight,
+              fontStyle: exactFontStyle,
+              fill: exactColor,
+              color: exactColor,
+              backgroundColor: exactBg,
+              linkUrl: exactLinkUrl,
+              paraBoundaries: {
+                left: pLeft,
+                right: pRight,
+                width: pWidth,
+                isLastLine,
+              },
+            },
+          };
+
+          newExportObjects.push({
+            type: 'textbox',
+            text: lText,
+            left: pLeft,
+            top: lBlock.pdfTop,
+            width: pWidth,
+            height: lBlock.pdfHeight || lBlock.height,
+            fontSize: exactFontSize,
+            fontFamily: exactFontFamily,
+            fontWeight: exactFontWeight,
+            fontStyle: exactFontStyle,
+            fill: exactColor,
+            backgroundColor: isLinkOnly ? 'transparent' : exactBg,
+            padding: 0,
+            isPdfContentEdit: true,
+            isLinkOnly,
+            textAlign: exactAlign,
+            linkUrl: exactLinkUrl,
+            originalBlockId: lId,
+            linesInfo: [{
+              pdfLeft: lBlock.pdfLeft,
+              pdfTop: lBlock.pdfTop,
+              pdfX: lBlock.baseVx ?? lBlock.pdfX,
+              pdfWidth: lBlock.pdfWidth || lBlock.rawWidth,
+              pdfHeight: lBlock.pdfHeight,
+              rawFontSize: exactFontSize,
+              baseVy: lBlock.baseVy,
+              paraLeft: pLeft,
+              paraRight: pRight,
+              paraWidth: pWidth,
+              isLastLine,
+            }],
+            originalPdfCoords: {
+              x: lBlock.pdfX,
+              y: lBlock.pdfY,
+              width: lBlock.rawWidth,
+              height: lBlock.pdfHeightVal,
+              fontSize: exactFontSize,
+            },
+          });
+        }
+
+        return {
+          ...prev,
+          [pageId]: {
+            ...prevPageData,
+            contentEdits: currentContentEdits,
+            objects: [...filteredObjects, ...newExportObjects],
+          },
+        };
+      }
+
+      // Single line editing
+      const filteredObjects = (prevPageData.objects || []).filter(
+        (o) => o.originalBlockId !== blockId
+      );
+
+      const bLeft = Number.isFinite(block.pdfLeft) ? block.pdfLeft : (block.left ?? 0);
+      const bWidth = Number.isFinite(block.pdfWidth) ? block.pdfWidth : (block.width ?? 100);
+
+      const exportObj = {
+        type: 'textbox',
+        text: newText,
+        left: bLeft,
+        top: block.pdfTop,
+        width: bWidth,
+        height: block.pdfHeight || block.height,
+        fontSize: exactFontSize,
+        fontFamily: exactFontFamily,
+        fontWeight: exactFontWeight,
+        fontStyle: exactFontStyle,
+        fill: exactColor,
+        backgroundColor: isLinkOnly ? 'transparent' : exactBg,
+        padding: 0,
+        isPdfContentEdit: true,
+        isLinkOnly,
+        textAlign: exactAlign,
+        linkUrl: exactLinkUrl,
+        originalBlockId: blockId,
+        linesInfo: [{
+          pdfLeft: block.pdfLeft,
+          pdfTop: block.pdfTop,
+          pdfX: block.baseVx ?? block.pdfX,
+          pdfWidth: block.pdfWidth || block.rawWidth,
+          pdfHeight: block.pdfHeight,
+          rawFontSize: exactFontSize,
+          baseVy: block.baseVy,
+          paraLeft: bLeft,
+          paraRight: bLeft + bWidth,
+          paraWidth: bWidth,
+          isLastLine: true,
         }],
         originalPdfCoords: {
           x: block.pdfX,
@@ -531,9 +1047,19 @@ export function EditorLayout({
             [blockId]: {
               text: newText,
               originalText: originalText || block.str,
+              textAlign: exactAlign,
+              linkUrl: exactLinkUrl,
+              isLinkOnly,
+              paraBoundaries: {
+                left: bLeft,
+                right: bLeft + bWidth,
+                width: bWidth,
+                isLastLine: true,
+              },
               block: {
                 ...block,
                 str: newText,
+                textAlign: exactAlign,
                 fontSize: exactFontSize,
                 rawFontSize: exactFontSize,
                 fontFamily: exactFontFamily,
@@ -542,6 +1068,13 @@ export function EditorLayout({
                 fill: exactColor,
                 color: exactColor,
                 backgroundColor: exactBg,
+                linkUrl: exactLinkUrl,
+                paraBoundaries: {
+                  left: bLeft,
+                  right: bLeft + bWidth,
+                  width: bWidth,
+                  isLastLine: true,
+                },
               },
             },
           },
@@ -550,7 +1083,17 @@ export function EditorLayout({
       };
     });
 
-    setSelectedObjectProps((prev) => (prev ? { ...prev, text: newText, fill: exactColor } : null));
+    setSelectedObjectProps((prev) => (prev ? {
+      ...prev,
+      text: newText,
+      fill: exactColor,
+      fontSize: exactFontSize,
+      fontFamily: exactFontFamily,
+      fontWeight: exactFontWeight,
+      fontStyle: exactFontStyle,
+      textAlign: exactAlign,
+      linkUrl: exactLinkUrl,
+    } : null));
   }, [pages, pageEdits, recordChange]);
 
   // Reset a PDF content block back to original
@@ -873,7 +1416,10 @@ export function EditorLayout({
                 activeTool={activeTool}
                 savedEdits={pageEdits[page.id] || null}
                 selectedBlockId={selectedObjectProps?.isPdfContentEdit ? selectedObjectProps.blockId : null}
+                selectedObject={selectedObjectProps}
+                initialOcrBlocks={pageNum === 1 ? initialOcrBlocks : null}
                 onSelectContentBlock={handleSelectContentBlock}
+                onApplyAlignment={handleApplyAlignment}
                 onPageVisible={handlePageVisible}
                 onPageEditsChange={handlePageEditsChange}
                 onObjectSelected={handleObjectSelected}
@@ -903,6 +1449,8 @@ export function EditorLayout({
           onDuplicateSelected={handleDuplicateSelected}
           onSaveContentEdit={handleSaveContentEdit}
           onResetContentEdit={handleResetContentEdit}
+          onApplyAlignment={handleApplyAlignment}
+          onOcrImage={handleOcrImage}
           onClose={() => setSelectedObjectProps(null)}
         />
       </div>

@@ -34,6 +34,21 @@ async function main() {
   await import('./phase6.test.js');
 
   console.log('\n=============================================');
+  console.log('Running Test Suite: Text Alignment & Distribution');
+  console.log('=============================================');
+  await import('./alignment.test.js');
+
+  console.log('\n=============================================');
+  console.log('Running Test Suite: Hyperlinks');
+  console.log('=============================================');
+  await import('./hyperlink.test.js');
+
+  console.log('\n=============================================');
+  console.log('Running Test Suite: Image Text Editing & OCR');
+  console.log('=============================================');
+  await import('./imageOcr.test.js');
+
+  console.log('\n=============================================');
   console.log('All Test Suites Completed Successfully! ✔');
   console.log('=============================================');
 }

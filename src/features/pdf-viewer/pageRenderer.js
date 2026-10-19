@@ -104,7 +104,7 @@ export async function renderPdfPage(pdfDoc, pageNumber, canvas, options = {}) {
     canvas.style.width = `${displayWidth}px`;
     canvas.style.height = `${displayHeight}px`;
 
-    const ctx = canvas.getContext('2d', { alpha: false });
+    const ctx = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
     if (!ctx) {
       throw new Error('Failed to acquire 2D context from canvas.');
     }
