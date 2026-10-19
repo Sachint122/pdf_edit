@@ -6,7 +6,11 @@
 
 import Tesseract from 'tesseract.js';
 import { Textbox } from 'fabric';
-import { clusterLinesIntoParagraphs } from '../features/editing/pdfContentEditor.js';
+import {
+  analyzeImageTextLines,
+  analyzeFontAttributes,
+  clusterImageParagraphBlocks,
+} from '../features/image-editor/imageVisualAnalysis.js';
 
 export const SUPPORTED_IMAGE_TYPES = [
   'image/png',
@@ -179,74 +183,97 @@ export async function recognizeOcr(imageFile, options = {}) {
  * @param {number} [scaleFactor=1] - Coordinate multiplier if image was resized
  * @returns {Array<object>} - Array of text blocks for in-place editing
  */
-export function extractOcrTextBlocks(ocrResult, pageHeightPt = 792, scaleFactor = 1) {
+export function extractOcrTextBlocks(ocrResult, pageHeightPt = 792, scaleFactor = 1, imageElement = null) {
   if (!ocrResult || !ocrResult.success) return [];
 
   const rawLines = ocrResult.lines || [];
-  const lineBlocks = [];
+  let lineBlocks = [];
 
-  for (let i = 0; i < rawLines.length; i++) {
-    const item = rawLines[i];
-    const bbox = item.bbox;
-    if (!bbox) continue;
+  // 1. If an image element is provided or available, perform deep visual pixel analysis
+  if (imageElement) {
+    try {
+      lineBlocks = analyzeImageTextLines(imageElement, rawLines, { scaleFactor });
+    } catch (e) {
+      console.warn('Visual pixel analysis failed, using coordinate fallback:', e);
+      lineBlocks = [];
+    }
+  }
 
-    const x0 = Math.round(bbox.x0 * scaleFactor);
-    const y0 = Math.round(bbox.y0 * scaleFactor);
-    const x1 = Math.round(bbox.x1 * scaleFactor);
-    const y1 = Math.round(bbox.y1 * scaleFactor);
+  // 2. Fallback if visual analysis produced no blocks or running in non-DOM environment
+  if (lineBlocks.length === 0) {
+    for (let i = 0; i < rawLines.length; i++) {
+      const item = rawLines[i];
+      const bbox = item.bbox;
+      if (!bbox) continue;
 
-    const lineWidth = Math.max(10, x1 - x0);
-    const lineHeight = Math.max(10, y1 - y0);
+      const x0 = Math.round(bbox.x0 * scaleFactor);
+      const y0 = Math.round(bbox.y0 * scaleFactor);
+      const x1 = Math.round(bbox.x1 * scaleFactor);
+      const y1 = Math.round(bbox.y1 * scaleFactor);
 
-    // PDF Y=0 is bottom-left; top of the line in PDF points = pageHeight - y1
-    const pdfY = pageHeightPt - y1;
-    const estimatedFontSize = Math.max(9, Math.round(lineHeight * 0.82));
-    const baseVy = y0 + estimatedFontSize * 0.76;
-    const trimmed = (item.text || '').trim();
-    const isLineHeading = (trimmed.length > 1 && trimmed.length < 50 && /^[A-Z0-9\s.,&/\-–|:()]+$/.test(trimmed) && /[A-Z]/.test(trimmed)) ||
-      /^(experience|education|skills|projects|summary|objective|certifications|awards|contact|work experience|employment history|profile)/i.test(trimmed);
+      const lineWidth = Math.max(10, x1 - x0);
+      const lineHeight = Math.max(10, y1 - y0);
 
-    lineBlocks.push({
-      str: item.text,
-      text: item.text,
-      baseVx: x0,
-      baseVy,
-      rawWidth: lineWidth,
-      rawFontSize: estimatedFontSize,
-      ascent: estimatedFontSize * 0.8,
-      descent: estimatedFontSize * 0.2,
-      pdfLeft: x0,
-      pdfTop: y0,
-      pdfWidth: lineWidth,
-      pdfHeight: lineHeight,
-      pdfFontSize: estimatedFontSize,
-      screenLeft: x0,
-      screenTop: y0,
-      screenWidth: lineWidth,
-      screenHeight: lineHeight,
-      left: x0,
-      top: y0,
-      width: lineWidth,
-      height: lineHeight,
-      fontSize: estimatedFontSize,
-      fontFamily: 'Helvetica',
-      isBold: isLineHeading,
-      isItalic: false,
-      fontWeight: isLineHeading ? 'bold' : 'normal',
-      fontStyle: 'normal',
-      fill: '#000000',
-      color: '#000000',
-      backgroundColor: '#ffffff',
-      pdfX: x0,
-      pdfY,
-      pdfHeightVal: lineHeight,
-      confidence: item.confidence || 0,
-      isOcrDetected: true,
-      originalText: item.text,
-      originalStr: item.text,
-      textAlign: 'left',
-      tesseractParaId: item.tesseractParaId || null,
-    });
+      const fontAttrs = analyzeFontAttributes(null, bbox, { r: 255, g: 255, b: 255 }, 800, pageHeightPt, item.text);
+
+      // Estimate font size separately for each block based on line height and role
+      let estimatedFontSize;
+      if (fontAttrs.isHeading) {
+        estimatedFontSize = Math.max(14, Math.round(lineHeight * 0.85));
+      } else if (fontAttrs.isJobTitle) {
+        estimatedFontSize = Math.max(12, Math.round(lineHeight * 0.82));
+      } else {
+        estimatedFontSize = Math.max(9, Math.round(lineHeight * 0.68));
+      }
+
+      const pdfY = pageHeightPt - y1;
+      const baseVy = y0 + estimatedFontSize * 0.76;
+
+      lineBlocks.push({
+        str: item.text,
+        text: item.text,
+        baseVx: x0,
+        baseVy,
+        rawWidth: lineWidth,
+        rawFontSize: estimatedFontSize,
+        ascent: estimatedFontSize * 0.8,
+        descent: estimatedFontSize * 0.2,
+        pdfLeft: x0,
+        pdfTop: y0,
+        pdfWidth: lineWidth,
+        pdfHeight: lineHeight,
+        pdfFontSize: estimatedFontSize,
+        screenLeft: x0,
+        screenTop: y0,
+        screenWidth: lineWidth,
+        screenHeight: lineHeight,
+        left: x0,
+        top: y0,
+        width: lineWidth,
+        height: lineHeight,
+        fontSize: estimatedFontSize,
+        fontFamily: fontAttrs.fontFamily || 'Helvetica',
+        isBold: fontAttrs.isBold,
+        isItalic: false,
+        fontWeight: fontAttrs.fontWeight,
+        fontStyle: 'normal',
+        fill: '#000000',
+        color: '#000000',
+        backgroundColor: '#ffffff',
+        pdfX: x0,
+        pdfY,
+        pdfHeightVal: lineHeight,
+        confidence: item.confidence || 0,
+        isOcrDetected: true,
+        isHeading: fontAttrs.isHeading,
+        isJobTitle: fontAttrs.isJobTitle,
+        isBody: fontAttrs.isBody,
+        originalText: item.text,
+        originalStr: item.text,
+        textAlign: 'left',
+        tesseractParaId: item.tesseractParaId || null,
+      });
+    }
   }
 
   // Preserve natural reading order (top-to-bottom)
@@ -258,7 +285,7 @@ export function extractOcrTextBlocks(ocrResult, pageHeightPt = 792, scaleFactor 
     return a.left - b.left;
   });
 
-  return clusterLinesIntoParagraphs(lineBlocks, 1);
+  return clusterImageParagraphBlocks(lineBlocks, 1);
 }
 
 /**
@@ -283,7 +310,27 @@ export async function runOcrOnFile(file, options = {}) {
   if (isImageFile(file)) {
     const ocrResult = await recognizeOcr(file, options);
     if (ocrResult.success) {
-      const textBlocks = extractOcrTextBlocks(ocrResult, pageHeightPt, scaleFactor);
+      let imageElement = null;
+      if (typeof document !== 'undefined') {
+        try {
+          if (file instanceof HTMLImageElement) {
+            imageElement = file;
+          } else if (typeof file === 'string' && (file.startsWith('data:') || file.startsWith('blob:'))) {
+            imageElement = new Image();
+            imageElement.src = file;
+            await new Promise((res) => { imageElement.onload = res; imageElement.onerror = res; });
+          } else if (file instanceof Blob || (typeof File !== 'undefined' && file instanceof File)) {
+            const url = URL.createObjectURL(file);
+            imageElement = new Image();
+            imageElement.src = url;
+            await new Promise((res) => { imageElement.onload = res; imageElement.onerror = res; });
+          }
+        } catch {
+          // ignore error in image loading
+        }
+      }
+
+      const textBlocks = extractOcrTextBlocks(ocrResult, pageHeightPt, scaleFactor, imageElement);
       return {
         success: true,
         textBlocks,

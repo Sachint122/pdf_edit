@@ -38,6 +38,7 @@ export function TopToolbar({
   activeTool = 'edit-content',
   canUndo = false,
   canRedo = false,
+  isImage = false,
   onUndo,
   onRedo,
   onRotateCurrentPage,
@@ -69,6 +70,9 @@ export function TopToolbar({
       onSelectPage(activePage + 1);
     }
   };
+
+  const isJpg = /\.jpe?g$/i.test(fileName || '');
+  const exportLabel = isImage ? (isJpg ? 'Export JPG' : 'Export PNG') : 'Export PDF';
 
   const triggerOpenNew = () => {
     uploadModeRef.current = 'open';
@@ -360,10 +364,10 @@ export function TopToolbar({
             type="button"
             className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white shadow-sm shadow-blue-600/30 active:scale-98 transition-all"
             onClick={onOpenExport}
-            title="Export and Download Edited PDF (Ctrl+S)"
+            title={`${exportLabel} (Ctrl+S)`}
           >
             <Download size={13} />
-            <span>Export PDF</span>
+            <span>{exportLabel}</span>
           </button>
         </div>
 
@@ -726,12 +730,12 @@ export function TopToolbar({
                 {isExporting ? (
                   <>
                     <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                    <span>Exporting PDF...</span>
+                    <span>Exporting...</span>
                   </>
                 ) : (
                   <>
                     <Download size={18} />
-                    <span>Export & Download PDF</span>
+                    <span>{exportLabel}</span>
                   </>
                 )}
               </button>

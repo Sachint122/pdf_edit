@@ -23,6 +23,8 @@ export default function App() {
     loadSamplePdf,
     clearError,
     initialOcrBlocks,
+    isImage,
+    imageMeta,
   } = usePdfDocument();
 
   // If no document is currently loaded, render the Upload / Welcome Screen
@@ -50,6 +52,12 @@ export default function App() {
       pagesMeta={pagesMeta}
       onOpenFile={loadFromFile}
       initialOcrBlocks={initialOcrBlocks}
+      loading={loading}
+      loadingMessage={loadingMessage}
+      error={error}
+      onClearError={clearError}
+      isImage={isImage}
+      imageMeta={imageMeta}
     />
   );
 }

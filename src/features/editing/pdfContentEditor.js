@@ -484,9 +484,8 @@ export function clusterLinesIntoParagraphs(lineBlocks, pageNumber = 1) {
       }
     }
 
-    // Harmonize dominant font family, bold styling, and text color across paragraph
+    // Harmonize dominant font family and bold styling across paragraph (preserving individual line color)
     const dominantFont = group.lines.find((l) => l.fontFamily && l.fontFamily !== 'Helvetica')?.fontFamily || group.lines[0].fontFamily || 'Helvetica';
-    const dominantColor = group.lines.find((l) => l.fill && l.fill !== '#1e293b' && l.fill !== '#000000')?.fill || group.lines[0].fill || '#000000';
     const dominantBold = group.lines.some((l) => l.isBold || l.fontWeight === 'bold');
 
     for (let idx = 0; idx < group.lines.length; idx++) {
@@ -494,11 +493,11 @@ export function clusterLinesIntoParagraphs(lineBlocks, pageNumber = 1) {
       group.lines[idx].rawFontSize = dominantFontSize;
       group.lines[idx].fontSize = dominantFontSize;
       group.lines[idx].pdfFontSize = dominantFontSize;
-      if (dominantFont !== 'Helvetica') {
+      if (dominantFont !== 'Helvetica' && !group.lines[idx].fontFamily) {
         group.lines[idx].fontFamily = dominantFont;
       }
-      group.lines[idx].fill = dominantColor;
-      group.lines[idx].color = dominantColor;
+      group.lines[idx].fill = group.lines[idx].fill || '#000000';
+      group.lines[idx].color = group.lines[idx].color || group.lines[idx].fill || '#000000';
       if (dominantBold) {
         group.lines[idx].isBold = true;
         group.lines[idx].fontWeight = 'bold';

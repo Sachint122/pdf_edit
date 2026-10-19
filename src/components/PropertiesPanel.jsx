@@ -3,7 +3,7 @@
  * Contextual inspector for configuring active canvas objects (Text, Shapes, Images).
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Type,
   Square,
@@ -32,20 +32,27 @@ import {
 function ContentEditSection({ selectedObject, onSaveContentEdit, onResetContentEdit, onApplyAlignment, onClose }) {
   const isPara = Boolean(selectedObject.isParagraphMember && selectedObject.paraLines && selectedObject.paraLines.length > 1);
   const [editScope, setEditScope] = useState('paragraph'); // 'paragraph' | 'line'
-  const [contentEditText, setContentEditText] = useState(selectedObject.text ?? '');
-  const [contentColor, setContentColor] = useState(
-    selectedObject.fill || selectedObject.block?.fill || selectedObject.block?.color || '#000000'
-  );
-  const [contentAlign, setContentAlign] = useState(selectedObject.textAlign || 'left');
+  const targetText = selectedObject.text ?? '';
+  const targetColor = selectedObject.fill || selectedObject.block?.fill || selectedObject.block?.color || '#000000';
+  const targetAlign = selectedObject.textAlign || 'left';
+  const targetLinkUrl = selectedObject.linkUrl || selectedObject.block?.linkUrl || '';
+
+  const [contentEditText, setContentEditText] = useState(targetText);
+  const [contentColor, setContentColor] = useState(targetColor);
+  const [contentAlign, setContentAlign] = useState(targetAlign);
+  const [contentLinkUrl, setContentLinkUrl] = useState(targetLinkUrl);
+
+  useEffect(() => {
+    setContentEditText(targetText);
+    setContentColor(targetColor);
+    setContentAlign(targetAlign);
+    setContentLinkUrl(targetLinkUrl);
+  }, [selectedObject.blockId, targetColor, targetAlign, targetLinkUrl, targetText]);
 
   const detectedFontSize = Math.round(selectedObject.block?.rawFontSize || selectedObject.block?.fontSize || selectedObject.fontSize || 12);
   const detectedFontFamily = selectedObject.block?.fontFamily || selectedObject.fontFamily || 'Helvetica';
   const isDetectedBold = Boolean(selectedObject.block?.isBold || selectedObject.fontWeight === 'bold');
   const isDetectedItalic = Boolean(selectedObject.block?.isItalic || selectedObject.fontStyle === 'italic');
-
-  const [contentLinkUrl, setContentLinkUrl] = useState(
-    selectedObject.linkUrl || selectedObject.block?.linkUrl || ''
-  );
 
   const handleAlignSelect = (align) => {
     setContentAlign(align);
@@ -285,7 +292,7 @@ function ContentEditSection({ selectedObject, onSaveContentEdit, onResetContentE
           {isPara && editScope === 'paragraph' && (
             <p className="text-[10px] text-emerald-400/90 flex items-center gap-1 font-medium bg-emerald-500/10 border border-emerald-500/20 rounded-lg px-2.5 py-1.5">
               <span>✦</span>
-              <span>Auto-reflow active: Text wraps across all {selectedObject.paraLines.length} lines with no empty gaps.</span>
+              <span>Layout anchored: Text preserves document line structure with no empty gaps.</span>
             </p>
           )}
         </div>

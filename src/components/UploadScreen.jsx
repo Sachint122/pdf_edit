@@ -85,10 +85,10 @@ export function UploadScreen({
             <FileText size={26} />
           </div>
           <h1 className="text-2xl md:text-3xl font-extrabold text-white tracking-tight">
-            Frontend-Only PDF & Image Editor
+            Professional PDF & Image Editor
           </h1>
           <p className="text-xs md:text-sm text-slate-400 max-w-md mx-auto leading-relaxed">
-            Open, inspect, and edit PDF documents and images locally in your browser with zero server uploads.
+            Edit text, add annotations, insert signatures, and export documents locally with complete privacy.
           </p>
         </div>
 
@@ -167,10 +167,10 @@ export function UploadScreen({
                   className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700/80 active:scale-98 transition-all"
                   onClick={onLoadSample}
                   disabled={loading}
-                  title="Generate a local multi-page sample PDF"
+                  title="Explore a pre-loaded professional sample document"
                 >
                   <Sparkles size={14} className="text-amber-400" />
-                  <span>Load Sample PDF</span>
+                  <span>Explore Demo Document</span>
                 </button>
               </div>
             </>

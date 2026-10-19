@@ -39,6 +39,8 @@ import { DEFAULT_WATERMARK_CONFIG, DEFAULT_PAGE_NUMBER_CONFIG } from '../feature
 import { reflowParagraphText } from '../features/editing/pdfContentEditor.js';
 import { Textbox } from 'fabric';
 import { runOcrOnFile } from '../utils/ocr.js';
+import { Loader2, AlertCircle, X } from 'lucide-react';
+import { downloadModifiedImage } from '../features/image-editor/exportImage.js';
 
 export function EditorLayout({
   pdfDoc,
@@ -47,6 +49,12 @@ export function EditorLayout({
   pagesMeta = [],
   onOpenFile,
   initialOcrBlocks = null,
+  loading = false,
+  loadingMessage = '',
+  error = null,
+  onClearError,
+  isImage = false,
+  imageMeta = null,
 }) {
   // Document Pages State with stable IDs
   const [pages, setPages] = useState(() => initializePagesState(pagesMeta));
@@ -524,7 +532,8 @@ export function EditorLayout({
 
   // Select a text block on any page (with unified paragraph clustering & reflow support)
   const handleSelectContentBlock = useCallback((pageId, pageNumber, block, currentText) => {
-    const isPara = Boolean(block.isParagraphMember && Array.isArray(block.paraLines) && block.paraLines.length > 1);
+    const isImageBlock = Boolean(isImage || block.isOcrDetected || block.id?.startsWith('img-'));
+    const isPara = !isImageBlock && Boolean(block.isParagraphMember && Array.isArray(block.paraLines) && block.paraLines.length > 1);
 
     let initialText = currentText;
     let initialOriginalText = block.originalStr || block.str;
@@ -532,33 +541,46 @@ export function EditorLayout({
     const initialAlign = currentEdits[block.id]?.textAlign || block.textAlign || 'left';
     const initialLinkUrl = currentEdits[block.id]?.linkUrl || block.linkUrl || '';
 
-    if (isPara) {
-      const paraTexts = block.paraLines.map((line) => {
-        if (currentEdits[line.id] !== undefined) {
-          return currentEdits[line.id].text;
+    if (isImageBlock) {
+      initialText = currentText ?? (currentEdits[block.id]?.text ?? block.str ?? '');
+      initialOriginalText = block.originalStr || block.str;
+    } else if (isPara) {
+      const paraTexts = [];
+      for (const line of block.paraLines) {
+        const edit = currentEdits[line.id];
+        if (edit?.isClearedLine) continue;
+        if (edit !== undefined) {
+          paraTexts.push(edit.text ?? '');
+        } else {
+          paraTexts.push(line.originalStr || line.str || '');
         }
-        return line.originalStr || line.str;
-      });
-      initialText = paraTexts.filter((t) => t !== undefined && t !== null).join(' ').replace(/\s+/g, ' ').trim();
+      }
+      initialText = paraTexts
+        .filter((t) => t !== undefined && t !== null && String(t).trim() !== '')
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
       initialOriginalText = block.paraLines.map((l) => l.originalStr || l.str).filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
     }
 
     const effectiveBlock = currentEdits[block.id]?.block || block;
-    const effectiveParaLines = (block.paraLines || []).map((line) => {
-      return currentEdits[line.id]?.block || {
-        ...line,
-        fill: effectiveBlock.fill || effectiveBlock.color || line.fill || line.color || '#000000',
-        color: effectiveBlock.color || effectiveBlock.fill || line.color || line.fill || '#000000',
-        backgroundColor: effectiveBlock.backgroundColor || line.backgroundColor || '#ffffff',
-        fontFamily: effectiveBlock.fontFamily || line.fontFamily || 'Helvetica',
-        fontSize: effectiveBlock.rawFontSize || line.rawFontSize || 12,
-        rawFontSize: effectiveBlock.rawFontSize || line.rawFontSize || 12,
-        isBold: effectiveBlock.isBold ?? line.isBold ?? false,
-        isItalic: effectiveBlock.isItalic ?? line.isItalic ?? false,
-        fontWeight: effectiveBlock.fontWeight || line.fontWeight || 'normal',
-        fontStyle: effectiveBlock.fontStyle || line.fontStyle || 'normal',
-      };
-    });
+    const effectiveParaLines = isPara
+      ? (block.paraLines || []).filter((line) => !currentEdits[line.id]?.isClearedLine).map((line) => {
+        return currentEdits[line.id]?.block || {
+          ...line,
+          fill: line.fill || line.color || '#000000',
+          color: line.color || line.fill || '#000000',
+          backgroundColor: line.backgroundColor || effectiveBlock.backgroundColor || '#ffffff',
+          fontFamily: line.fontFamily || effectiveBlock.fontFamily || 'Helvetica',
+          fontSize: line.rawFontSize || line.fontSize || effectiveBlock.rawFontSize || 11,
+          rawFontSize: line.rawFontSize || line.fontSize || effectiveBlock.rawFontSize || 11,
+          isBold: line.isBold !== undefined ? line.isBold : (effectiveBlock.isBold ?? false),
+          isItalic: line.isItalic !== undefined ? line.isItalic : (effectiveBlock.isItalic ?? false),
+          fontWeight: line.fontWeight || (line.isBold ? 'bold' : 'normal'),
+          fontStyle: line.fontStyle || (line.isItalic ? 'italic' : 'normal'),
+        };
+      })
+      : [];
 
     setSelectedObjectProps({
       type: 'textbox',
@@ -566,9 +588,9 @@ export function EditorLayout({
       pageId,
       pageNumber,
       blockId: block.id,
-      paraId: block.paraId,
+      paraId: isPara ? block.paraId : undefined,
       isParagraphMember: isPara,
-      paraLines: effectiveParaLines,
+      paraLines: isPara ? effectiveParaLines : undefined,
       lineText: currentText,
       text: initialText,
       originalText: initialOriginalText,
@@ -586,7 +608,7 @@ export function EditorLayout({
     if (index !== -1) {
       setActivePage(index + 1);
     }
-  }, [pages, pageEdits]);
+  }, [pages, pageEdits, isImage]);
 
   // Apply text alignment (left, center, right, justify) to selected text block or paragraph
   const handleApplyAlignment = useCallback((align, scope = 'paragraph') => {
@@ -634,9 +656,20 @@ export function EditorLayout({
       const currentContentEdits = { ...(prevPageData.contentEdits || {}) };
 
       if (isPara) {
+        const isImagePara = Boolean(
+          isImage
+          || selectedObjectProps.block?.isOcrDetected
+          || selectedObjectProps.blockId?.startsWith('img-')
+        );
+        // Width from full original OCR slots so center/right/justify use the real column.
+        const widthSource = (
+          isImagePara && selectedObjectProps.originalParaLines?.length
+            ? selectedObjectProps.originalParaLines
+            : selectedObjectProps.paraLines
+        );
         const lines = selectedObjectProps.paraLines;
-        const pLeft = Math.min(...lines.map((l) => (Number.isFinite(l.pdfLeft) ? l.pdfLeft : (l.baseVx ?? 0))));
-        const pRight = Math.max(...lines.map((l) => {
+        const pLeft = Math.min(...widthSource.map((l) => (Number.isFinite(l.pdfLeft) ? l.pdfLeft : (l.baseVx ?? 0))));
+        const pRight = Math.max(...widthSource.map((l) => {
           const lLeft = Number.isFinite(l.pdfLeft) ? l.pdfLeft : (l.baseVx ?? 0);
           const lWidth = Number.isFinite(l.pdfWidth) ? l.pdfWidth : (l.rawWidth ?? 100);
           return lLeft + lWidth;
@@ -644,47 +677,76 @@ export function EditorLayout({
         const pWidth = Math.max(20, pRight - pLeft);
 
         const paraLineIds = new Set(lines.map((l) => l.id));
+        // Also update alignment on cleared/synthetic image edits belonging to this paragraph.
+        for (const [editId, edit] of Object.entries(currentContentEdits)) {
+          if (edit?.isClearedLine || edit?.isSyntheticLine) {
+            paraLineIds.add(editId);
+          }
+        }
         const filteredObjects = (prevPageData.objects || []).filter(
           (o) => !paraLineIds.has(o.originalBlockId)
         );
 
         const newExportObjects = [];
+        const activeContentLines = lines.filter((l) => {
+          const edit = currentContentEdits[l.id];
+          if (edit?.isClearedLine) return false;
+          const text = edit?.text ?? l.str ?? '';
+          return text.trim().length > 0;
+        });
+        const lastContentId = activeContentLines.length > 0
+          ? activeContentLines[activeContentLines.length - 1].id
+          : lines[lines.length - 1]?.id;
 
-        for (let idx = 0; idx < lines.length; idx++) {
-          const l = lines[idx];
-          const isLastLine = idx === lines.length - 1;
-          const lText = currentContentEdits[l.id]?.text ?? l.str ?? '';
+        const applyAlignToEdit = (l, lText, isLastLine, flags = {}) => {
+          const prevEdit = currentContentEdits[l.id] || {};
+          const lFontSize = l.rawFontSize || l.fontSize || l.pdfFontSize || exactFontSize;
+          const lFontFamily = l.fontFamily || exactFontFamily;
+          const lFontWeight = l.fontWeight || (l.isBold ? 'bold' : 'normal');
+          const lFontStyle = l.fontStyle || (l.isItalic ? 'italic' : 'normal');
+          const lColor = l.fill || l.color || exactColor;
+          const lBg = l.backgroundColor || exactBg;
+          const isClearedLine = Boolean(flags.isClearedLine ?? prevEdit.isClearedLine);
+          const isSyntheticLine = Boolean(flags.isSyntheticLine ?? prevEdit.isSyntheticLine);
+          const isThisLastLine = !isClearedLine && l.id === lastContentId;
 
           currentContentEdits[l.id] = {
+            ...prevEdit,
             text: lText,
-            originalText: l.originalStr || l.str,
+            originalText: prevEdit.originalText || l.originalStr || l.str,
             textAlign: align,
+            isClearedLine,
+            isSyntheticLine,
             paraBoundaries: {
               left: pLeft,
               right: pRight,
               width: pWidth,
-              isLastLine,
+              isLastLine: isThisLastLine,
             },
             block: {
-              ...(currentContentEdits[l.id]?.block || l),
+              ...(prevEdit.block || l),
               str: lText,
               textAlign: align,
-              fontSize: exactFontSize,
-              rawFontSize: exactFontSize,
-              fontFamily: exactFontFamily,
-              fontWeight: exactFontWeight,
-              fontStyle: exactFontStyle,
-              fill: exactColor,
-              color: exactColor,
-              backgroundColor: exactBg,
+              fontSize: lFontSize,
+              rawFontSize: lFontSize,
+              fontFamily: lFontFamily,
+              fontWeight: lFontWeight,
+              fontStyle: lFontStyle,
+              fill: lColor,
+              color: lColor,
+              backgroundColor: lBg,
+              isSyntheticLine,
+              isOcrDetected: Boolean(l.isOcrDetected || isImagePara),
               paraBoundaries: {
                 left: pLeft,
                 right: pRight,
                 width: pWidth,
-                isLastLine,
+                isLastLine: isClearedLine ? false : isLastLine,
               },
             },
           };
+
+          if (isClearedLine) return;
 
           newExportObjects.push({
             type: 'textbox',
@@ -693,12 +755,12 @@ export function EditorLayout({
             top: l.pdfTop,
             width: pWidth,
             height: l.pdfHeight || l.height,
-            fontSize: exactFontSize,
-            fontFamily: exactFontFamily,
-            fontWeight: exactFontWeight,
-            fontStyle: exactFontStyle,
-            fill: exactColor,
-            backgroundColor: exactBg,
+            fontSize: lFontSize,
+            fontFamily: lFontFamily,
+            fontWeight: lFontWeight,
+            fontStyle: lFontStyle,
+            fill: lColor,
+            backgroundColor: lBg,
             padding: 0,
             isPdfContentEdit: true,
             textAlign: align,
@@ -724,6 +786,22 @@ export function EditorLayout({
               fontSize: exactFontSize,
             },
           });
+        };
+
+        for (let idx = 0; idx < lines.length; idx++) {
+          const l = lines[idx];
+          const isLastLine = l.id === lastContentId;
+          const lText = currentContentEdits[l.id]?.text ?? l.str ?? '';
+          applyAlignToEdit(l, lText, isLastLine);
+        }
+
+        // Keep cleared image rows white-out-only but sync their alignment metadata.
+        if (isImagePara) {
+          for (const [editId, edit] of Object.entries(currentContentEdits)) {
+            if (!edit?.isClearedLine) continue;
+            const l = edit.block || { id: editId };
+            applyAlignToEdit({ ...l, id: editId }, '', false, { isClearedLine: true });
+          }
         }
 
         return {
@@ -825,8 +903,17 @@ export function EditorLayout({
       };
     });
 
-    setSelectedObjectProps((prev) => (prev ? { ...prev, textAlign: align } : null));
-  }, [selectedObjectProps, pages, pageEdits, recordChange]);
+    setSelectedObjectProps((prev) => {
+      if (!prev) return null;
+      return {
+        ...prev,
+        textAlign: align,
+        paraLines: Array.isArray(prev.paraLines)
+          ? prev.paraLines.map((l) => ({ ...l, textAlign: align }))
+          : prev.paraLines,
+      };
+    });
+  }, [selectedObjectProps, pages, pageEdits, recordChange, isImage]);
 
   // Save modified text content for a PDF block with exact font style, size, color, and layout preservation
   const handleSaveContentEdit = useCallback((
@@ -865,7 +952,8 @@ export function EditorLayout({
     const isTextUnmodified = (newText === originalText) && (exactColor === (selectedObj.fill || block.fill || block.color || '#000000'));
     const isLinkOnly = isTextUnmodified && Boolean(exactLinkUrl && exactLinkUrl.trim().length > 0);
 
-    const isPara = scope === 'paragraph' && Boolean(selectedObj.isParagraphMember && Array.isArray(selectedObj.paraLines) && selectedObj.paraLines.length > 1);
+    const isImageDoc = Boolean(isImage || selectedObj.block?.isOcrDetected || selectedObj.blockId?.startsWith('img-'));
+    const isPara = scope === 'paragraph' && !isImageDoc && Boolean(selectedObj.isParagraphMember && Array.isArray(selectedObj.paraLines) && selectedObj.paraLines.length > 1);
 
     setPageEdits((prev) => {
       const prevPageData = prev[pageId] || { version: '6.0.0', objects: [] };
@@ -890,18 +978,41 @@ export function EditorLayout({
         }));
         const pWidth = Math.max(20, pRight - pLeft);
 
-        const paraLineIds = new Set(selectedObj.paraLines.map((l) => l.id));
+        const paraId = selectedObj.paraId || selectedObj.block?.paraId;
+
+        const paraLineIds = new Set(lines.map((l) => l.id));
+        for (const item of reflowed) {
+          paraLineIds.add(item.lineId);
+        }
         const filteredObjects = (prevPageData.objects || []).filter(
           (o) => !paraLineIds.has(o.originalBlockId)
         );
         const newExportObjects = [];
+        const contentLineIds = reflowed.filter((r) => !r.isClearedLine).map((r) => r.lineId);
+        const lastContentLineId = contentLineIds[contentLineIds.length - 1];
 
         for (let idx = 0; idx < reflowed.length; idx++) {
           const item = reflowed[idx];
           const lBlock = item.block;
           const lId = item.lineId;
           const lText = item.text || '';
-          const isLastLine = idx === reflowed.length - 1;
+          const isClearedLine = Boolean(item.isClearedLine);
+          const isSyntheticLine = Boolean(item.isSyntheticLine);
+          const isLastLine = !isClearedLine && lId === lastContentLineId;
+
+          const lFontSize = customFontSize !== undefined
+            ? customFontSize
+            : (lBlock.rawFontSize || lBlock.fontSize || lBlock.pdfFontSize || exactFontSize);
+          const lFontFamily = customFontFamily !== undefined
+            ? customFontFamily
+            : (lBlock.fontFamily || exactFontFamily);
+          const lFontWeight = customBold !== undefined
+            ? (customBold ? 'bold' : 'normal')
+            : (lBlock.fontWeight || (lBlock.isBold ? 'bold' : 'normal'));
+          const lFontStyle = customItalic !== undefined
+            ? (customItalic ? 'italic' : 'normal')
+            : (lBlock.fontStyle || (lBlock.isItalic ? 'italic' : 'normal'));
+          const lBg = lBlock.backgroundColor || exactBg;
 
           currentContentEdits[lId] = {
             text: lText,
@@ -909,6 +1020,8 @@ export function EditorLayout({
             textAlign: exactAlign,
             linkUrl: exactLinkUrl,
             isLinkOnly,
+            isClearedLine,
+            isSyntheticLine,
             paraBoundaries: {
               left: pLeft,
               right: pRight,
@@ -919,15 +1032,18 @@ export function EditorLayout({
               ...lBlock,
               str: lText,
               textAlign: exactAlign,
-              fontSize: exactFontSize,
-              rawFontSize: exactFontSize,
-              fontFamily: exactFontFamily,
-              fontWeight: exactFontWeight,
-              fontStyle: exactFontStyle,
+              fontSize: lFontSize,
+              rawFontSize: lFontSize,
+              fontFamily: lFontFamily,
+              fontWeight: lFontWeight,
+              fontStyle: lFontStyle,
               fill: exactColor,
               color: exactColor,
-              backgroundColor: exactBg,
+              backgroundColor: lBg,
               linkUrl: exactLinkUrl,
+              paraId: paraId || lBlock.paraId,
+              isSyntheticLine,
+              isOcrDetected: Boolean(lBlock.isOcrDetected || isImageDoc),
               paraBoundaries: {
                 left: pLeft,
                 right: pRight,
@@ -937,6 +1053,9 @@ export function EditorLayout({
             },
           };
 
+          // Cleared image lines only need contentEdits for white-out; skip empty export objects.
+          if (isClearedLine) continue;
+
           newExportObjects.push({
             type: 'textbox',
             text: lText,
@@ -944,12 +1063,12 @@ export function EditorLayout({
             top: lBlock.pdfTop,
             width: pWidth,
             height: lBlock.pdfHeight || lBlock.height,
-            fontSize: exactFontSize,
-            fontFamily: exactFontFamily,
-            fontWeight: exactFontWeight,
-            fontStyle: exactFontStyle,
+            fontSize: lFontSize,
+            fontFamily: lFontFamily,
+            fontWeight: lFontWeight,
+            fontStyle: lFontStyle,
             fill: exactColor,
-            backgroundColor: isLinkOnly ? 'transparent' : exactBg,
+            backgroundColor: isLinkOnly ? 'transparent' : lBg,
             padding: 0,
             isPdfContentEdit: true,
             isLinkOnly,
@@ -962,7 +1081,7 @@ export function EditorLayout({
               pdfX: lBlock.baseVx ?? lBlock.pdfX,
               pdfWidth: lBlock.pdfWidth || lBlock.rawWidth,
               pdfHeight: lBlock.pdfHeight,
-              rawFontSize: exactFontSize,
+              rawFontSize: lFontSize,
               baseVy: lBlock.baseVy,
               paraLeft: pLeft,
               paraRight: pRight,
@@ -1094,7 +1213,7 @@ export function EditorLayout({
       textAlign: exactAlign,
       linkUrl: exactLinkUrl,
     } : null));
-  }, [pages, pageEdits, recordChange]);
+  }, [pages, pageEdits, recordChange, isImage]);
 
   // Reset a PDF content block back to original
   const handleResetContentEdit = useCallback((selectedObj) => {
@@ -1188,6 +1307,26 @@ export function EditorLayout({
     if (isExporting) return;
     setIsExporting(true);
 
+    // Isolated Image Export Pipeline (Preserves original PNG/JPG format)
+    if (isImage && imageMeta?.originalImageFile) {
+      try {
+        await downloadModifiedImage(imageMeta.originalImageFile, {
+          fileName: imageMeta.originalFileName || fileName,
+          pageEdits: pageEdits[pages[0]?.id] || {},
+          rotation: pages[0]?.rotation || 0,
+          scaleFactor: imageMeta.scaleFactor || 1,
+        });
+        setIsExporting(false);
+        return;
+      } catch (imgErr) {
+        console.error('Failed to export image:', imgErr);
+        alert('Failed to export image: ' + (imgErr.message || 'Unknown error'));
+        setIsExporting(false);
+        return;
+      }
+    }
+
+    // Standard Untouched PDF Export Pipeline
     const defaultFilename = (fileName ? fileName.replace(/\.pdf$/i, '') : 'document') + '-edited.pdf';
 
     try {
@@ -1224,7 +1363,7 @@ export function EditorLayout({
       alert('Failed to assemble and export PDF: ' + (err.message || 'Unknown error'));
       setIsExporting(false);
     }
-  }, [isExporting, fileName, rawBuffer, pdfDoc, pages, pageEdits, watermarkConfig, pageNumberConfig, sourceBuffers]);
+  }, [isExporting, isImage, imageMeta, fileName, rawBuffer, pdfDoc, pages, pageEdits, watermarkConfig, pageNumberConfig, sourceBuffers]);
 
   // ==========================================
   // ==========================================
@@ -1375,6 +1514,7 @@ export function EditorLayout({
         activeTool={activeTool}
         canUndo={canUndo}
         canRedo={canRedo}
+        isImage={isImage}
         onUndo={handleUndo}
         onRedo={handleRedo}
         onRotateCurrentPage={handleRotateCurrentPage}
@@ -1507,6 +1647,41 @@ export function EditorLayout({
         isOpen={shortcutsModalOpen}
         onClose={() => setShortcutsModalOpen(false)}
       />
+
+      {/* Top Toolbar Image/Document Processing Loading Overlay */}
+      {loading && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-[#131924] border border-white/[0.1] rounded-2xl p-6 max-w-sm w-full flex flex-col items-center justify-center text-center shadow-2xl">
+            <Loader2 size={36} className="animate-spin text-blue-500 mb-3" />
+            <div className="text-base font-bold text-white mb-1">
+              {loadingMessage || 'Processing document...'}
+            </div>
+            <div className="text-xs text-slate-400">
+              Please wait a moment...
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Top Toolbar Error Banner */}
+      {error && (
+        <div className="fixed top-14 left-1/2 -translate-x-1/2 z-50 max-w-md w-full px-4">
+          <div className="w-full flex items-center gap-3 p-3.5 rounded-xl bg-red-500/90 border border-red-500 text-white text-xs shadow-2xl backdrop-blur-md">
+            <AlertCircle size={18} className="flex-shrink-0 text-white" />
+            <div className="flex-1 font-medium">{error}</div>
+            {onClearError && (
+              <button
+                type="button"
+                className="p-1 rounded-lg hover:bg-white/20 text-white transition-colors"
+                onClick={onClearError}
+                aria-label="Dismiss error"
+              >
+                <X size={16} />
+              </button>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

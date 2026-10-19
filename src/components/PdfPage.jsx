@@ -23,6 +23,25 @@ import { extractObjectProperties } from '../utils/objectProperties.js';
 import { extractPageTextBlocks } from '../features/editing/pdfContentEditor.js';
 
 let textMeasureCtx = null;
+
+function ensureTextMeasureCtx() {
+  if (typeof document === 'undefined') return null;
+  if (!textMeasureCtx) {
+    const c = document.createElement('canvas');
+    textMeasureCtx = c.getContext('2d');
+  }
+  return textMeasureCtx;
+}
+
+function measureRenderedTextWidth(text, fontSize, fontStack, isBold, isItalic) {
+  const ctx = ensureTextMeasureCtx();
+  if (ctx && text) {
+    ctx.font = `${isItalic ? 'italic ' : ''}${isBold ? 'bold ' : ''}${fontSize}px ${fontStack}`;
+    return ctx.measureText(text).width;
+  }
+  return (text || '').length * fontSize * 0.52;
+}
+
 /**
  * Computes natural typographic word distribution for justified alignment.
  * Avoids excessive word spacing and clamps gap to natural limits matching PDF export.
@@ -35,16 +54,11 @@ function computeJustifiedGap(text, containerWidth, fontSize, fontStack, isBold, 
   }
 
   let totalWordsWidth = 0;
-  if (typeof document !== 'undefined') {
-    if (!textMeasureCtx) {
-      const c = document.createElement('canvas');
-      textMeasureCtx = c.getContext('2d');
-    }
-    if (textMeasureCtx) {
-      textMeasureCtx.font = `${isBold ? 'bold ' : ''}${isItalic ? 'italic ' : ''}${fontSize}px ${fontStack}`;
-      for (const w of words) {
-        totalWordsWidth += textMeasureCtx.measureText(w).width;
-      }
+  const ctx = ensureTextMeasureCtx();
+  if (ctx) {
+    ctx.font = `${isItalic ? 'italic ' : ''}${isBold ? 'bold ' : ''}${fontSize}px ${fontStack}`;
+    for (const w of words) {
+      totalWordsWidth += ctx.measureText(w).width;
     }
   }
 
@@ -56,11 +70,11 @@ function computeJustifiedGap(text, containerWidth, fontSize, fontStack, isBold, 
   const remaining = availableWidth - totalWordsWidth;
   const gapCount = words.length - 1;
 
-  // Natural maximum gap threshold (1.35x normal space width) to avoid excessive spacing between words
-  const maxGap = normalSpace * 1.35;
+  // Natural maximum gap threshold (1.20x normal space width) to avoid excessive spacing between words
+  const maxGap = normalSpace * 1.20;
 
-  // If the line is short (< 80% of available width) or words overflow, keep natural spacing
-  if (totalWordsWidth < availableWidth * 0.80 || remaining <= 0) {
+  // If the line is short (< 85% of available width) or words overflow, keep natural spacing
+  if (totalWordsWidth < availableWidth * 0.85 || remaining <= 0) {
     return { gap: normalSpace, words };
   }
 
@@ -283,7 +297,7 @@ export function PdfPage({
           let detectedFont = b.fontFamily || 'Helvetica';
           let updatedParaLines = b.paraLines;
 
-          if (b.isOcrDetected && !b.sampledText) {
+          if (b.isOcrDetected && !b.sampledText && (!b.fill || b.fill === '#000000')) {
             const boxLeft = b.screenLeft ?? b.left;
             const boxWidth = b.screenWidth ?? b.width;
             const boxTop = b.screenTop ?? b.top;
@@ -338,7 +352,12 @@ export function PdfPage({
             }
 
             const inkRatio = totalChecked > 0 ? (inkCount / totalChecked) : 0;
-            detectedBold = Boolean(b.isBold || inkRatio >= 0.23);
+            // Respect OCR detected bold if explicitly set; otherwise require substantial ink ratio
+            if (b.isBold !== undefined) {
+              detectedBold = b.isBold;
+            } else {
+              detectedBold = Boolean(inkRatio >= 0.32);
+            }
 
             // Detect serif footings vs clean sans-serif stems
             let baselineInk = 0;
@@ -366,15 +385,20 @@ export function PdfPage({
             }
 
             if (Array.isArray(b.paraLines)) {
-              updatedParaLines = b.paraLines.map((l) => ({
-                ...l,
-                fill: newColor,
-                color: newColor,
-                backgroundColor: newBg,
-                fontFamily: detectedFont,
-                isBold: detectedBold,
-                fontWeight: detectedBold ? 'bold' : 'normal',
-              }));
+              updatedParaLines = b.paraLines.map((l) => {
+                if (l.id === b.id) {
+                  return {
+                    ...l,
+                    fill: newColor,
+                    color: newColor,
+                    backgroundColor: newBg,
+                    fontFamily: detectedFont,
+                    isBold: detectedBold,
+                    fontWeight: detectedBold ? 'bold' : 'normal',
+                  };
+                }
+                return l;
+              });
             }
           }
 
@@ -559,21 +583,52 @@ export function PdfPage({
 
       {/* Interactive Direct In-Place PDF Text Content Editing Layer */}
       <div className={`absolute inset-0 z-12 ${activeTool === 'edit-content' ? 'pointer-events-auto' : 'pointer-events-none'}`}>
-        {textBlocks.map((block) => {
+        {(() => {
+          const contentEdits = savedEdits?.contentEdits || {};
+          const knownIds = new Set(textBlocks.map((b) => b.id));
+          // Image-editor synthetic lines exist only in contentEdits after reflow growth.
+          const syntheticBlocks = Object.entries(contentEdits)
+            .filter(([, edit]) => edit?.isSyntheticLine && edit.block && !knownIds.has(edit.block.id))
+            .map(([, edit]) => {
+              const b = edit.block;
+              return {
+                ...b,
+                screenLeft: (Number.isFinite(b.pdfLeft) ? b.pdfLeft : (b.left ?? 0)) * scale,
+                screenTop: (Number.isFinite(b.pdfTop) ? b.pdfTop : (b.top ?? 0)) * scale,
+                screenWidth: (Number.isFinite(b.pdfWidth) ? b.pdfWidth : (b.width ?? 100)) * scale,
+                screenHeight: (Number.isFinite(b.pdfHeight) ? b.pdfHeight : (b.height ?? 14)) * scale,
+                isOcrDetected: true,
+                isParagraphMember: true,
+              };
+            });
+          return [...textBlocks, ...syntheticBlocks];
+        })().map((block) => {
           const contentEdits = savedEdits?.contentEdits || {};
           const currentEdit = contentEdits[block.id];
           const isEdited = !!currentEdit;
           const currentText = isEdited ? currentEdit.text : block.str;
           const textAlign = currentEdit?.textAlign || block.textAlign || 'left';
           const paraBoundaries = currentEdit?.paraBoundaries;
-          const isParaLastLine = block.paraLines
-            ? (block.lineIndex === block.paraLines.length - 1)
-            : true;
-          const isLastLine = Boolean(paraBoundaries ? paraBoundaries.isLastLine : isParaLastLine);
+          const isClearedLine = Boolean(currentEdit?.isClearedLine);
+          let computedIsLastLine = false;
+          if (paraBoundaries && typeof paraBoundaries.isLastLine === 'boolean') {
+            computedIsLastLine = paraBoundaries.isLastLine;
+          } else if (block.paraLines && block.paraLines.length > 0) {
+            const activeParaLineIds = block.paraLines
+              .map((l) => l.id)
+              .filter((id) => !contentEdits[id]?.isClearedLine);
+            computedIsLastLine = activeParaLineIds.length > 0
+              ? activeParaLineIds[activeParaLineIds.length - 1] === block.id
+              : (block.lineIndex === block.paraLines.length - 1);
+          } else {
+            computedIsLastLine = true;
+          }
+          const isLastLine = !isClearedLine && computedIsLastLine;
 
-          const isSelected = selectedBlockId === block.id;
+          const isSelected = !isClearedLine && selectedBlockId === block.id;
           const isSelectedParaMember = Boolean(
             !isSelected &&
+            !isClearedLine &&
             selectedObject?.isParagraphMember &&
             selectedObject?.paraLines?.some((l) => l.id === block.id)
           );
@@ -590,12 +645,15 @@ export function PdfPage({
             ? '"Courier New", Courier, monospace'
             : '"Helvetica Neue", Helvetica, Arial, sans-serif';
 
-          const renderLeft = paraBoundaries
+          const paraLeft = paraBoundaries
             ? Math.round(paraBoundaries.left * scale)
             : Math.round(block.screenLeft ?? block.left ?? 0);
-          const renderWidth = paraBoundaries
+          const paraWidth = paraBoundaries
             ? Math.round(paraBoundaries.width * scale)
             : Math.round(block.screenWidth ?? block.width ?? 100);
+          const origLeft = Math.round(block.screenLeft ?? block.left ?? paraLeft);
+          const origWidth = Math.round(block.screenWidth ?? block.width ?? paraWidth);
+          const origTop = Math.round(block.screenTop ?? block.top ?? 0);
 
           const activeAlignment = selectedObject && (selectedBlockId === block.id || (selectedObject.isParagraphMember && selectedObject.paraLines?.some((l) => l.id === block.id)))
             ? (selectedObject.textAlign || textAlign)
@@ -603,17 +661,75 @@ export function PdfPage({
 
           const hasLink = Boolean(currentEdit?.linkUrl || block.linkUrl);
           const linkUrl = currentEdit?.linkUrl || block.linkUrl || '';
+          const isImageOcr = Boolean(block.isOcrDetected || effectiveBlock.isOcrDetected || currentEdit?.isSyntheticLine);
 
           if (isEdited) {
-            const boxHeight = Math.max(
-              Math.round(exactSize * 1.092),
-              Math.round(block.screenHeight ?? block.height ?? (exactSize * 1.10))
+            // Image OCR: natural line-height matching original document typography and unedited OCR line boxes.
+            const naturalHeight = Math.round(block.screenHeight ?? block.height ?? (exactSize * 1.30));
+            const boxHeight = isImageOcr
+              ? Math.max(Math.round(exactSize * 1.22), naturalHeight)
+              : Math.max(
+                Math.round(exactSize * 1.092),
+                Math.round(block.screenHeight ?? block.height ?? (exactSize * 1.10))
+              );
+
+            const measuredTextW = measureRenderedTextWidth(
+              currentText || '',
+              exactSize,
+              fontStack,
+              isBold,
+              isItalic
             );
+
+            // Image left-align and justified last-lines hug text like unedited Experience boxes.
+            // Center, right, and non-last justified lines need the full paragraph column width.
+            const needsFullParaWidth = activeAlignment === 'center'
+              || activeAlignment === 'right'
+              || (activeAlignment === 'justify' && !isLastLine);
+
+            const renderLeft = needsFullParaWidth ? paraLeft : origLeft;
+            const renderWidth = needsFullParaWidth
+              ? paraWidth
+              : Math.max(12, Math.ceil(measuredTextW) + 2);
+
+            // White-out must always cleanly cover original ink across the line without gaps or artifact exposure.
+            const maskLeft = needsFullParaWidth
+              ? paraLeft
+              : Math.min(origLeft, renderLeft);
+            const maskWidth = needsFullParaWidth
+              ? paraWidth
+              : Math.max(origWidth, Math.ceil(measuredTextW) + 4, (renderLeft + Math.ceil(measuredTextW) + 2) - maskLeft);
+            const maskTop = origTop - 1;
+            const maskHeight = boxHeight + 2;
+            const bgColor = effectiveBlock.backgroundColor || block.backgroundColor || '#ffffff';
+
+            // Image-editor cleared OCR rows: tight white-out only — never a selection row.
+            if (isClearedLine) {
+              return (
+                <div
+                  key={`cleared-${block.id}`}
+                  className="absolute pointer-events-none border-0"
+                  style={{
+                    left: origLeft - 1,
+                    top: maskTop,
+                    width: origWidth + 2,
+                    height: maskHeight,
+                    backgroundColor: bgColor,
+                    zIndex: 16,
+                  }}
+                  aria-hidden="true"
+                />
+              );
+            }
+
+            const cssTextAlign = activeAlignment === 'justify' && !isLastLine
+              ? 'left'
+              : (activeAlignment === 'center' || activeAlignment === 'right' ? activeAlignment : 'left');
 
             return (
               <div
                 key={`edited-${block.id}`}
-                className={`absolute box-border cursor-pointer pointer-events-auto select-none transition-all flex items-center ${
+                className={`absolute box-border cursor-pointer pointer-events-auto select-none transition-all ${
                   isSelected
                     ? 'border-2 border-blue-600 shadow-[0_0_0_2px_rgba(37,99,235,0.35)] z-28'
                     : isSelectedParaMember
@@ -624,8 +740,8 @@ export function PdfPage({
                 }`}
                 style={{
                   left: renderLeft,
-                  top: Math.round(block.screenTop ?? block.top ?? 0),
-                  width: renderWidth,
+                  top: origTop,
+                  width: needsFullParaWidth ? paraWidth : renderWidth,
                   height: boxHeight,
                   minHeight: boxHeight,
                   paddingLeft: '0px',
@@ -635,12 +751,12 @@ export function PdfPage({
                   fontWeight: isBold ? 700 : 400,
                   fontStyle: isItalic ? 'italic' : 'normal',
                   color: effectiveBlock.fill || effectiveBlock.color || block.fill || block.color || '#000000',
-                  backgroundColor: effectiveBlock.backgroundColor || block.backgroundColor || '#ffffff',
-                  lineHeight: 1.09,
+                  backgroundColor: 'transparent',
+                  lineHeight: `${boxHeight}px`,
                   letterSpacing: 'normal',
-                  overflow: 'hidden',
+                  overflow: 'visible',
                   whiteSpace: 'nowrap',
-                  justifyContent: activeAlignment === 'center' ? 'center' : activeAlignment === 'right' ? 'flex-end' : 'flex-start',
+                  textAlign: cssTextAlign,
                 }}
                 title={hasLink ? `Hyperlink: "${linkUrl}" | Click to edit` : (isSelectedParaMember ? `Paragraph member: "${currentText.slice(0, 40)}"` : `Click to edit: "${currentText.slice(0, 40)}"`)}
                 onClick={(e) => {
@@ -650,6 +766,20 @@ export function PdfPage({
                   }
                 }}
               >
+                {/* Background white-out (covers original image glyphs without inflating selection) */}
+                <div
+                  className="absolute pointer-events-none"
+                  style={{
+                    left: maskLeft - renderLeft,
+                    top: maskTop - origTop - 1,
+                    width: maskWidth,
+                    height: maskHeight + 2,
+                    backgroundColor: bgColor,
+                    zIndex: 0,
+                  }}
+                  aria-hidden="true"
+                />
+
                 {/* Floating Contextual Toolbar for Selected Block */}
                 {isSelected && (
                   <div
@@ -720,39 +850,38 @@ export function PdfPage({
                   </div>
                 )}
 
-                {activeAlignment === 'justify' && !isLastLine ? (() => {
-                  const justResult = computeJustifiedGap(
-                    currentText,
-                    renderWidth,
-                    exactSize,
-                    fontStack,
-                    isBold,
-                    isItalic
-                  );
-                  return (
-                    <div
-                      className="flex items-center justify-start pointer-events-none"
-                      style={{ gap: `${justResult.gap}px` }}
+                <div className="relative z-10 pointer-events-none" style={{ width: '100%', height: '100%' }}>
+                  {activeAlignment === 'justify' && !isLastLine ? (() => {
+                    const justResult = computeJustifiedGap(
+                      currentText,
+                      needsFullParaWidth ? paraWidth : renderWidth,
+                      exactSize,
+                      fontStack,
+                      isBold,
+                      isItalic
+                    );
+                    return (
+                      <div
+                        className="flex items-center justify-start"
+                        style={{ gap: `${justResult.gap}px`, height: '100%' }}
+                      >
+                        {justResult.words.map((w, wIdx) => (
+                          <span key={wIdx}>{w}</span>
+                        ))}
+                      </div>
+                    );
+                  })() : (
+                    <span
+                      className="block w-full"
+                      style={{
+                        textAlign: cssTextAlign,
+                        lineHeight: `${boxHeight}px`,
+                      }}
                     >
-                      {justResult.words.map((w, wIdx) => (
-                        <span key={wIdx}>{w}</span>
-                      ))}
-                    </div>
-                  );
-                })() : (
-                  <span
-                    className={`w-full pointer-events-none ${
-                      activeAlignment === 'center'
-                        ? 'text-center'
-                        : activeAlignment === 'right'
-                        ? 'text-right'
-                        : 'text-left'
-                    }`}
-                    style={{ wordSpacing: 'normal' }}
-                  >
-                    {currentText || '\u00A0'}
-                  </span>
-                )}
+                      {currentText || '\u00A0'}
+                    </span>
+                  )}
+                </div>
 
                 {hasLink && (
                   <span
@@ -765,7 +894,7 @@ export function PdfPage({
                 )}
 
                 {!isSelected && !isSelectedParaMember && (
-                  <span className="absolute -top-3.5 -right-0.5 text-[9px] font-semibold text-white bg-blue-600 rounded px-1 py-px shadow-xs opacity-0 hover:opacity-100 group-hover:opacity-100 pointer-events-none transition-opacity whitespace-nowrap">
+                  <span className="absolute -top-3.5 -right-0.5 text-[9px] font-semibold text-white bg-blue-600 rounded px-1 py-px shadow-xs opacity-0 hover:opacity-100 group-hover:opacity-100 pointer-events-none transition-opacity whitespace-nowrap z-10">
                     ✎ Edit
                   </span>
                 )}

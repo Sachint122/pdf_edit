@@ -93,6 +93,8 @@ export function usePdfDocument() {
         error: null,
         isPasswordProtected: false,
         initialOcrBlocks: extraMeta?.ocrBlocks || null,
+        isImage: !!extraMeta?.isImage,
+        imageMeta: extraMeta?.imageMeta || null,
       });
       return true;
     } catch (err) {
@@ -135,7 +137,7 @@ export function usePdfDocument() {
         }));
 
         try {
-          const { pdfBytes, fileName, textBlocks } = await convertImageToEditablePdf(file, {
+          const result = await convertImageToEditablePdf(file, {
             fileName: file.name,
             onProgress: (m) => {
               if (m.status === 'recognizing text') {
@@ -148,8 +150,17 @@ export function usePdfDocument() {
             },
           });
 
-          return await loadBuffer(pdfBytes.buffer || pdfBytes, fileName, pdfBytes.byteLength, {
-            ocrBlocks: textBlocks,
+          return await loadBuffer(result.pdfBytes.buffer || result.pdfBytes, result.fileName, result.pdfBytes.byteLength, {
+            ocrBlocks: result.textBlocks,
+            isImage: true,
+            imageMeta: {
+              originalImageFile: result.originalImageFile,
+              originalFileName: result.originalFileName,
+              originalFormat: result.originalFormat,
+              naturalWidth: result.naturalWidth,
+              naturalHeight: result.naturalHeight,
+              scaleFactor: result.scaleFactor,
+            },
           });
         } catch (imgErr) {
           console.error('Image to PDF OCR conversion failed:', imgErr);
@@ -198,7 +209,7 @@ export function usePdfDocument() {
     }));
     try {
       const buffer = await generateSamplePdf();
-      return await loadBuffer(buffer, 'Sample-Document.pdf', buffer.byteLength);
+      return await loadBuffer(buffer, 'Executive-Services-Agreement.pdf', buffer.byteLength);
     } catch (err) {
       console.error('Sample generation failed:', err);
       setDocState((prev) => ({

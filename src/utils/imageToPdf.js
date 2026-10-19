@@ -223,6 +223,20 @@ export async function convertImageToEditablePdf(imageSource, options = {}) {
     height: pageHeight,
     textBlocks,
     scaleFactor,
+    isImage: true,
+    originalImageFile: imageSource,
+    originalFileName: rawName,
+    originalFormat: isJpg ? 'image/jpeg' : 'image/png',
+    naturalWidth: origWidth,
+    naturalHeight: origHeight,
+    imageMeta: {
+      originalImageFile: imageSource,
+      originalFileName: rawName,
+      originalFormat: isJpg ? 'image/jpeg' : 'image/png',
+      naturalWidth: origWidth,
+      naturalHeight: origHeight,
+      scaleFactor,
+    },
   };
 }
 
