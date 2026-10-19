@@ -31,7 +31,7 @@ export const DEFAULT_LANG = 'eng';
  */
 export function isImageFile(fileOrType) {
   if (!fileOrType) return false;
-  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(fileOrType)) return true;
+  if (typeof globalThis.Buffer !== 'undefined' && globalThis.Buffer.isBuffer(fileOrType)) return true;
   if (fileOrType instanceof Uint8Array) return true;
   if (typeof fileOrType === 'string') {
     const lower = fileOrType.toLowerCase();

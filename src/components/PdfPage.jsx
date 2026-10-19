@@ -710,10 +710,10 @@ export function PdfPage({
                   key={`cleared-${block.id}`}
                   className="absolute pointer-events-none border-0"
                   style={{
-                    left: origLeft - 1,
-                    top: maskTop,
-                    width: origWidth + 2,
-                    height: maskHeight,
+                    left: origLeft,
+                    top: origTop,
+                    width: origWidth,
+                    height: boxHeight,
                     backgroundColor: bgColor,
                     zIndex: 16,
                   }}
@@ -770,10 +770,10 @@ export function PdfPage({
                 <div
                   className="absolute pointer-events-none"
                   style={{
-                    left: maskLeft - renderLeft,
-                    top: maskTop - origTop - 1,
-                    width: maskWidth,
-                    height: maskHeight + 2,
+                    left: Math.min(0, maskLeft - renderLeft),
+                    top: 0,
+                    width: Math.max(renderWidth, maskWidth),
+                    height: '100%',
                     backgroundColor: bgColor,
                     zIndex: 0,
                   }}
