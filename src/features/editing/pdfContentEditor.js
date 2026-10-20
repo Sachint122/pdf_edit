@@ -6,6 +6,7 @@
 
 import { Textbox } from 'fabric';
 import { OPS } from 'pdfjs-dist';
+import { calculateParagraphReflow, isHeadingText } from './layoutEngine.js';
 
 /**
  * Extracts accurate text fill colors and background colors from PDF.js operator list.
@@ -328,6 +329,14 @@ export async function extractPageTextBlocks(pdfDoc, pageNumber, scale = 1.0, rot
           pdfX: transform[4],
           pdfY: transform[5],
           pdfHeightVal: item.height || exactFontSize,
+          origPdfLeft: pdfLeft,
+          origPdfTop: pdfTop,
+          origPdfWidth: pdfWidth,
+          origPdfHeight: pdfHeight,
+          origBaseVx: baseVx,
+          origBaseVy: baseVy,
+          origScreenLeft: screenLeft,
+          origScreenTop: screenTop,
         });
       }
     }
@@ -357,18 +366,28 @@ export function clusterLinesIntoParagraphs(lineBlocks, pageNumber = 1) {
   let currentPara = null;
   const bulletRegex = /^([•\u2022\u25cf\u25cb\-*]|\d+[.)])\s+/;
 
-  const isSectionHeading = (str) => {
-    const trimmed = (str || '').trim();
-    if (trimmed.length < 2 || trimmed.length > 35) return false;
-    const hasLetters = /[A-Z]/.test(trimmed);
-    const hasNoLowercase = !/[a-z]/.test(trimmed);
-    return hasLetters && hasNoLowercase;
+  const isSectionHeading = (str, line = {}) => {
+    return isHeadingText(str, { fontSize: line.rawFontSize, isBold: line.isBold });
   };
+
+  // Pre-detect lines that share a horizontal baseline with another line (multi-column rows, key-value pairs, dates)
+  const multiElementLines = new Set();
+  for (let a = 0; a < lineBlocks.length; a++) {
+    for (let b = a + 1; b < lineBlocks.length; b++) {
+      const la = lineBlocks[a];
+      const lb = lineBlocks[b];
+      if (Math.abs(la.baseVy - lb.baseVy) <= Math.max(2.5, (la.rawFontSize || 11) * 0.25)) {
+        multiElementLines.add(la.id);
+        multiElementLines.add(lb.id);
+      }
+    }
+  }
 
   for (let i = 0; i < lineBlocks.length; i++) {
     const line = lineBlocks[i];
     const lineStr = (line.str || '').trim();
-    const isLineHeading = isSectionHeading(lineStr);
+    const isLineHeading = isSectionHeading(lineStr, line);
+    const isMultiElement = multiElementLines.has(line.id);
 
     if (!currentPara) {
       currentPara = {
@@ -383,7 +402,7 @@ export function clusterLinesIntoParagraphs(lineBlocks, pageNumber = 1) {
         baseVy: line.baseVy,
         tesseractParaId: line.tesseractParaId || null,
       };
-      if (isLineHeading) {
+      if (isLineHeading || isMultiElement) {
         paragraphGroups.push(currentPara);
         currentPara = null;
       }
@@ -391,13 +410,15 @@ export function clusterLinesIntoParagraphs(lineBlocks, pageNumber = 1) {
     }
 
     const prevLine = currentPara.lines[currentPara.lines.length - 1];
+    const prevStr = (prevLine.str || '').trim();
+    const prevIsMultiElement = multiElementLines.has(prevLine.id);
 
-    if (isLineHeading) {
+    if (isLineHeading || isMultiElement || prevIsMultiElement) {
       paragraphGroups.push(currentPara);
       currentPara = {
         id: `para-${pageNumber}-${paragraphGroups.length + 1}`,
         lines: [line],
-        isHeading: true,
+        isHeading: isLineHeading,
         fontFamily: line.fontFamily,
         rawFontSize: line.rawFontSize,
         isBold: line.isBold,
@@ -406,8 +427,10 @@ export function clusterLinesIntoParagraphs(lineBlocks, pageNumber = 1) {
         baseVy: line.baseVy,
         tesseractParaId: line.tesseractParaId || null,
       };
-      paragraphGroups.push(currentPara);
-      currentPara = null;
+      if (isLineHeading || isMultiElement) {
+        paragraphGroups.push(currentPara);
+        currentPara = null;
+      }
       continue;
     }
 
@@ -422,6 +445,7 @@ export function clusterLinesIntoParagraphs(lineBlocks, pageNumber = 1) {
     const validIndent = sameLeftMargin || isHangingIndent;
     const isNewBullet = bulletRegex.test(lineStr);
     const isColonLabel = /^[^:\n]{2,35}\s*:/.test(lineStr) || /^:\s+/.test(lineStr);
+    const prevIsColonLabel = /^[^:\n]{2,35}\s*:/.test(prevStr) || /^:\s+/.test(prevStr);
 
     const isSameTesseractPara = Boolean(
       line.tesseractParaId &&
@@ -432,6 +456,7 @@ export function clusterLinesIntoParagraphs(lineBlocks, pageNumber = 1) {
     const canCluster =
       !isNewBullet &&
       !isColonLabel &&
+      !prevIsColonLabel &&
       (
         (isSameTesseractPara && validLineGap) ||
         (sameFont && sameSize && validLineGap && validIndent)
@@ -468,8 +493,6 @@ export function clusterLinesIntoParagraphs(lineBlocks, pageNumber = 1) {
   let blockCounter = 1;
 
   for (const group of paragraphGroups) {
-    const isMultiLinePara = group.lines.length > 1;
-
     // Harmonize typography across lines in the same paragraph cluster
     // (Prevents ascenderless/descenderless lines from having mismatched font sizes)
     const paraFontSizes = group.lines.map((l) => l.rawFontSize || l.fontSize || 12);
@@ -517,6 +540,14 @@ export function clusterLinesIntoParagraphs(lineBlocks, pageNumber = 1) {
       pdfHeight: l.pdfHeight,
       baseVx: l.baseVx,
       baseVy: l.baseVy,
+      origPdfLeft: Number.isFinite(l.origPdfLeft) ? l.origPdfLeft : l.pdfLeft,
+      origPdfTop: Number.isFinite(l.origPdfTop) ? l.origPdfTop : l.pdfTop,
+      origPdfWidth: Number.isFinite(l.origPdfWidth) ? l.origPdfWidth : l.pdfWidth,
+      origPdfHeight: Number.isFinite(l.origPdfHeight) ? l.origPdfHeight : l.pdfHeight,
+      origBaseVx: Number.isFinite(l.origBaseVx) ? l.origBaseVx : l.baseVx,
+      origBaseVy: Number.isFinite(l.origBaseVy) ? l.origBaseVy : l.baseVy,
+      origScreenLeft: Number.isFinite(l.origScreenLeft) ? l.origScreenLeft : l.screenLeft,
+      origScreenTop: Number.isFinite(l.origScreenTop) ? l.origScreenTop : l.screenTop,
       fontFamily: l.fontFamily,
       isBold: l.isBold,
       isItalic: l.isItalic,
@@ -533,8 +564,16 @@ export function clusterLinesIntoParagraphs(lineBlocks, pageNumber = 1) {
 
       blocks.push({
         ...line,
+        origPdfLeft: Number.isFinite(line.origPdfLeft) ? line.origPdfLeft : line.pdfLeft,
+        origPdfTop: Number.isFinite(line.origPdfTop) ? line.origPdfTop : line.pdfTop,
+        origPdfWidth: Number.isFinite(line.origPdfWidth) ? line.origPdfWidth : line.pdfWidth,
+        origPdfHeight: Number.isFinite(line.origPdfHeight) ? line.origPdfHeight : line.pdfHeight,
+        origBaseVx: Number.isFinite(line.origBaseVx) ? line.origBaseVx : line.baseVx,
+        origBaseVy: Number.isFinite(line.origBaseVy) ? line.origBaseVy : line.baseVy,
+        origScreenLeft: Number.isFinite(line.origScreenLeft) ? line.origScreenLeft : line.screenLeft,
+        origScreenTop: Number.isFinite(line.origScreenTop) ? line.origScreenTop : line.screenTop,
         isParagraph: false,
-        isParagraphMember: isMultiLinePara,
+        isParagraphMember: true,
         paraId: group.id,
         lineIndex: idx,
         paraLines: groupLinesRef,
@@ -583,64 +622,29 @@ export function reflowParagraphText(paraLines, editedLineId, newText, existingEd
     combinedText = fullTextParts.join(' ').replace(/\s+/g, ' ').trim();
   }
 
-  const words = combinedText.length > 0 ? combinedText.split(' ') : [];
+  const reflow = calculateParagraphReflow(paraLines, combinedText);
   const results = [];
-  let wordIdx = 0;
 
-  // Compute maximum column width for this paragraph (usually lines 0 .. n-2 are full column width)
-  const nonLastLines = paraLines.slice(0, -1);
-  const maxLineWidth = nonLastLines.length > 0
-    ? Math.max(...nonLastLines.map((l) => l.rawWidth || 300))
-    : Math.max(...paraLines.map((l) => l.rawWidth || 300));
-
-  for (let i = 0; i < paraLines.length; i++) {
-    const line = paraLines[i];
-    const isLastLine = i === paraLines.length - 1;
-
-    // Available width for this line: non-last lines use maxLineWidth so words pack nicely
-    const availableWidth = (!isLastLine || paraLines.length === 1)
-      ? maxLineWidth
-      : Math.max(line.rawWidth || 300, maxLineWidth * 0.85);
-
-    // Approximate character capacity based on line's original width and character count
-    const origLength = Math.max(10, (line.str || '').trim().length);
-    const avgCharWidth = line.rawWidth > 0 && origLength > 0
-      ? (line.rawWidth / origLength)
-      : ((line.rawFontSize || 11) * 0.52);
-
-    const maxChars = Math.max(12, Math.floor(availableWidth / avgCharWidth));
-
-    const currentLineWords = [];
-    let currentLineLength = 0;
-
-    while (wordIdx < words.length) {
-      const nextWord = words[wordIdx];
-      const addedLength = currentLineWords.length === 0 ? nextWord.length : nextWord.length + 1;
-
-      // Fill line up to capacity (last line takes remaining words)
-      if (currentLineWords.length > 0 && !isLastLine && (currentLineLength + addedLength) > maxChars) {
-        break;
-      }
-
-      currentLineWords.push(nextWord);
-      currentLineLength += addedLength;
-      wordIdx++;
-    }
-
-    const arrangedLineText = currentLineWords.join(' ');
-
+  for (const line of reflow.newLines) {
     results.push({
       lineId: line.id,
-      text: arrangedLineText,
-      originalText: line.str,
+      text: line.text,
+      originalText: line.originalStr || '',
       block: line,
+      isSyntheticLine: Boolean(line.isSyntheticLine),
+      isClearedLine: false,
     });
   }
 
-  // If there are words still remaining after the last line, append them to the last line
-  if (wordIdx < words.length && results.length > 0) {
-    const remaining = words.slice(wordIdx).join(' ');
-    results[results.length - 1].text += (results[results.length - 1].text ? ' ' : '') + remaining;
+  for (const cl of reflow.clearedLines) {
+    results.push({
+      lineId: cl.id,
+      text: '',
+      originalText: cl.str || '',
+      block: cl,
+      isSyntheticLine: false,
+      isClearedLine: true,
+    });
   }
 
   return results;

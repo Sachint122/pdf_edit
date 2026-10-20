@@ -36,6 +36,8 @@ export function TopToolbar({
   activePage = 1,
   scale = 1.0,
   activeTool = 'edit-content',
+  editorMode = 'original',
+  onSelectEditorMode,
   canUndo = false,
   canRedo = false,
   isImage = false,
@@ -219,7 +221,39 @@ export function TopToolbar({
         </div>
 
         {/* Center Segment: Hero Floating Studio Tool Dock (Always Geometrically Centered) */}
-        <div className="absolute left-1/2 -translate-x-1/2 hidden md:flex items-center gap-1 bg-slate-900/90 border border-slate-800/90 p-1 rounded-xl shadow-lg shadow-black/30 backdrop-blur-md z-20">
+        <div className="absolute left-1/2 -translate-x-1/2 hidden md:flex items-center gap-1.5 bg-slate-900/90 border border-slate-800/90 p-1 rounded-xl shadow-lg shadow-black/30 backdrop-blur-md z-20">
+          {/* Mode Switcher: Mode 1 (Original PDF) vs Mode 2 (Document Flow) */}
+          <div className="inline-flex items-center bg-slate-950/80 p-0.5 rounded-lg border border-slate-800/90 mr-1 gap-0.5">
+            <button
+              type="button"
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-all cursor-pointer ${
+                editorMode === 'original'
+                  ? 'bg-blue-600 text-white shadow-xs'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
+              }`}
+              onClick={() => onSelectEditorMode && onSelectEditorMode('original')}
+              title="Original PDF Editor (Mode 1: Preserves exact visual layout and coordinates with zero shifting)"
+            >
+              <FileText size={13} />
+              <span>Original PDF</span>
+            </button>
+            <button
+              type="button"
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-all cursor-pointer ${
+                editorMode === 'flow'
+                  ? 'bg-indigo-600 text-white shadow-xs'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
+              }`}
+              onClick={() => onSelectEditorMode && onSelectEditorMode('flow')}
+              title="Document Flow Editor (Mode 2: Word-like continuous paragraph editing and reflow)"
+            >
+              <Sparkles size={13} className={editorMode === 'flow' ? 'text-amber-300' : 'text-indigo-400'} />
+              <span>Document Flow</span>
+            </button>
+          </div>
+
+          <div className="h-4 w-px bg-slate-800 mx-0.5" />
+
           {/* Edit Content Tool */}
           <div className="flex items-center gap-1">
             <button
@@ -519,7 +553,52 @@ export function TopToolbar({
               </span>
             </button>
 
-            {/* Section 1: Editing Mode */}
+            {/* Mode Switcher */}
+            <div className="flex flex-col gap-2">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                Editor Mode
+              </span>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (onSelectEditorMode) onSelectEditorMode('original');
+                    setMobileMenuOpen(false);
+                  }}
+                  className={`flex items-center gap-2.5 p-2.5 rounded-xl border text-left transition-all ${
+                    editorMode === 'original'
+                      ? 'bg-blue-600/25 border-blue-500/60 text-white'
+                      : 'bg-slate-800/60 border-slate-700/60 text-slate-300'
+                  }`}
+                >
+                  <FileText size={16} className="text-blue-400 shrink-0" />
+                  <div>
+                    <div className="text-xs font-bold leading-tight text-white">Original PDF</div>
+                    <div className="text-[10px] text-slate-400">Preserve Layout</div>
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (onSelectEditorMode) onSelectEditorMode('flow');
+                    setMobileMenuOpen(false);
+                  }}
+                  className={`flex items-center gap-2.5 p-2.5 rounded-xl border text-left transition-all ${
+                    editorMode === 'flow'
+                      ? 'bg-indigo-600/25 border-indigo-500/60 text-white'
+                      : 'bg-slate-800/60 border-slate-700/60 text-slate-300'
+                  }`}
+                >
+                  <Sparkles size={16} className="text-indigo-400 shrink-0" />
+                  <div>
+                    <div className="text-xs font-bold leading-tight text-white">Document Flow</div>
+                    <div className="text-[10px] text-slate-400">Word-Like Reflow</div>
+                  </div>
+                </button>
+              </div>
+            </div>
+
+            {/* Section 1: Editing Tools */}
             <div className="flex flex-col gap-2">
               <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
                 Editing Tools

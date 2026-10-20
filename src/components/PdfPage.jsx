@@ -102,6 +102,7 @@ export function PdfPage({
   onObjectDeselected,
   onRegisterCanvas,
   onUnregisterCanvas,
+  onPageTextBlocksExtracted,
 }) {
   const containerRef = useRef(null);
   const pdfCanvasRef = useRef(null);
@@ -111,6 +112,7 @@ export function PdfPage({
   const [isRendered, setIsRendered] = useState(page?.isBlank || false);
   const [renderError, setRenderError] = useState(null);
   const [textBlocks, setTextBlocks] = useState([]);
+  const pristineCanvasRef = useRef(null);
 
   const rotation = page?.rotation || 0;
   const isRotatedQuarter = rotation % 180 !== 0;
@@ -186,6 +188,20 @@ export function PdfPage({
         if (isCancelled) return;
 
         if (!result?.cancelled) {
+          try {
+            if (typeof document !== 'undefined') {
+              const pristine = document.createElement('canvas');
+              pristine.width = canvas.width;
+              pristine.height = canvas.height;
+              const pCtx = pristine.getContext('2d');
+              if (pCtx) {
+                pCtx.drawImage(canvas, 0, 0);
+                pristineCanvasRef.current = pristine;
+              }
+            }
+          } catch {
+            // Non-blocking
+          }
           setIsRendered(true);
         }
       } catch (err) {
@@ -204,6 +220,45 @@ export function PdfPage({
       cancelPdfPageRender(canvas);
     };
   }, [pdfDoc, page?.originalIndex, page?.isBlank, pageNumber, scale, rotation, baseWidth, baseHeight]);
+
+  // Synchronize native background PDF canvas with layout shifts (e.g. paragraph expansion)
+  useEffect(() => {
+    if (!isRendered || !pdfCanvasRef.current || !pristineCanvasRef.current) return;
+    const canvas = pdfCanvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const pristine = pristineCanvasRef.current;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(pristine, 0, 0);
+
+    const downstreamShift = savedEdits?.downstreamShift || 0;
+    const splitTop = savedEdits?.splitTop;
+
+    if (downstreamShift > 0 && Number.isFinite(splitTop)) {
+      const splitY = Math.round(splitTop * scale);
+      const shiftY = Math.round(downstreamShift * scale);
+      const sliceHeight = Math.max(0, canvas.height - splitY);
+
+      if (sliceHeight > 0) {
+        // Shift downstream slice (SKILLS, divider lines, EXPERIENCE, etc.) down by shiftY
+        ctx.drawImage(
+          pristine,
+          0,
+          splitY,
+          canvas.width,
+          sliceHeight,
+          0,
+          splitY + shiftY,
+          canvas.width,
+          sliceHeight
+        );
+        // Clean whiteout over newly created whitespace gap where expanded lines render
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, splitY, canvas.width, shiftY);
+      }
+    }
+  }, [isRendered, savedEdits?.downstreamShift, savedEdits?.splitTop, scale]);
 
   // Extract existing text items from the PDF page for direct in-place content editing
   useEffect(() => {
@@ -225,8 +280,14 @@ export function PdfPage({
               screenHeight: b.height * scale,
             }));
             setTextBlocks(scaled);
+            if (typeof onPageTextBlocksExtracted === 'function') {
+              onPageTextBlocksExtracted(page.id, scaled);
+            }
           } else {
             setTextBlocks(blocks);
+            if (typeof onPageTextBlocksExtracted === 'function') {
+              onPageTextBlocksExtracted(page.id, blocks);
+            }
           }
         }
       })
@@ -248,7 +309,7 @@ export function PdfPage({
       isSubscribed = false;
       setTextBlocks([]);
     };
-  }, [pdfDoc, page?.originalIndex, page?.isBlank, pageNumber, scale, rotation, initialOcrBlocks]);
+  }, [pdfDoc, page?.id, page?.originalIndex, page?.isBlank, pageNumber, scale, rotation, initialOcrBlocks, onPageTextBlocksExtracted]);
 
   // Enrich text blocks with real background color and text color from the rendered canvas
   useEffect(() => {
@@ -591,21 +652,24 @@ export function PdfPage({
             .filter(([, edit]) => edit?.isSyntheticLine && edit.block && !knownIds.has(edit.block.id))
             .map(([, edit]) => {
               const b = edit.block;
+              const parentParaLines = textBlocks.filter((tb) => tb.paraId && tb.paraId === b.paraId);
               return {
                 ...b,
                 screenLeft: (Number.isFinite(b.pdfLeft) ? b.pdfLeft : (b.left ?? 0)) * scale,
                 screenTop: (Number.isFinite(b.pdfTop) ? b.pdfTop : (b.top ?? 0)) * scale,
                 screenWidth: (Number.isFinite(b.pdfWidth) ? b.pdfWidth : (b.width ?? 100)) * scale,
                 screenHeight: (Number.isFinite(b.pdfHeight) ? b.pdfHeight : (b.height ?? 14)) * scale,
-                isOcrDetected: true,
+                isOcrDetected: Boolean(b.isOcrDetected),
                 isParagraphMember: true,
+                paraId: b.paraId,
+                paraLines: parentParaLines.length > 0 ? parentParaLines : b.paraLines,
               };
             });
           return [...textBlocks, ...syntheticBlocks];
         })().map((block) => {
           const contentEdits = savedEdits?.contentEdits || {};
           const currentEdit = contentEdits[block.id];
-          const isEdited = !!currentEdit;
+          const isEdited = Boolean(currentEdit && !currentEdit.isShifted);
           const currentText = isEdited ? currentEdit.text : block.str;
           const textAlign = currentEdit?.textAlign || block.textAlign || 'left';
           const paraBoundaries = currentEdit?.paraBoundaries;
@@ -651,9 +715,10 @@ export function PdfPage({
           const paraWidth = paraBoundaries
             ? Math.round(paraBoundaries.width * scale)
             : Math.round(block.screenWidth ?? block.width ?? 100);
-          const origLeft = Math.round(block.screenLeft ?? block.left ?? paraLeft);
-          const origWidth = Math.round(block.screenWidth ?? block.width ?? paraWidth);
-          const origTop = Math.round(block.screenTop ?? block.top ?? 0);
+          const origLeft = Math.round((Number.isFinite(block.origPdfLeft) ? block.origPdfLeft * scale : (block.screenLeft ?? block.left ?? paraLeft)));
+          const origWidth = Math.round((Number.isFinite(block.origPdfWidth) ? block.origPdfWidth * scale : (block.screenWidth ?? block.width ?? paraWidth)));
+          const origTop = Math.round((Number.isFinite(block.origPdfTop) ? block.origPdfTop * scale : (block.screenTop ?? block.top ?? 0)));
+          const origHeight = Math.round((Number.isFinite(block.origPdfHeight) ? block.origPdfHeight * scale : (block.screenHeight ?? block.height ?? 14)));
 
           const activeAlignment = selectedObject && (selectedBlockId === block.id || (selectedObject.isParagraphMember && selectedObject.paraLines?.some((l) => l.id === block.id)))
             ? (selectedObject.textAlign || textAlign)
@@ -687,23 +752,20 @@ export function PdfPage({
               || activeAlignment === 'right'
               || (activeAlignment === 'justify' && !isLastLine);
 
-            const renderLeft = needsFullParaWidth ? paraLeft : origLeft;
+            const renderTop = Math.round(Number.isFinite(effectiveBlock.pdfTop) ? effectiveBlock.pdfTop * scale : (effectiveBlock.screenTop ?? origTop));
+            const renderLeft = needsFullParaWidth ? paraLeft : Math.round(Number.isFinite(effectiveBlock.pdfLeft) ? effectiveBlock.pdfLeft * scale : (origLeft));
             const renderWidth = needsFullParaWidth
               ? paraWidth
               : Math.max(12, Math.ceil(measuredTextW) + 2);
-
-            // White-out must always cleanly cover original ink across the line without gaps or artifact exposure.
             const maskLeft = needsFullParaWidth
               ? paraLeft
               : Math.min(origLeft, renderLeft);
             const maskWidth = needsFullParaWidth
               ? paraWidth
               : Math.max(origWidth, Math.ceil(measuredTextW) + 4, (renderLeft + Math.ceil(measuredTextW) + 2) - maskLeft);
-            const maskTop = origTop - 1;
-            const maskHeight = boxHeight + 2;
             const bgColor = effectiveBlock.backgroundColor || block.backgroundColor || '#ffffff';
 
-            // Image-editor cleared OCR rows: tight white-out only — never a selection row.
+            // Cleared rows: tight white-out only at original position
             if (isClearedLine) {
               return (
                 <div
@@ -713,7 +775,7 @@ export function PdfPage({
                     left: origLeft,
                     top: origTop,
                     width: origWidth,
-                    height: boxHeight,
+                    height: Math.max(boxHeight, origHeight),
                     backgroundColor: bgColor,
                     zIndex: 16,
                   }}
@@ -727,20 +789,37 @@ export function PdfPage({
               : (activeAlignment === 'center' || activeAlignment === 'right' ? activeAlignment : 'left');
 
             return (
-              <div
-                key={`edited-${block.id}`}
-                className={`absolute box-border cursor-pointer pointer-events-auto select-none transition-all ${
-                  isSelected
-                    ? 'border-2 border-blue-600 shadow-[0_0_0_2px_rgba(37,99,235,0.35)] z-28'
-                    : isSelectedParaMember
-                    ? 'border border-blue-500/70 bg-blue-500/10 shadow-[0_0_0_1px_rgba(37,99,235,0.25)] z-20'
-                    : hasLink
-                    ? 'border border-blue-500/50 hover:border-blue-500 shadow-[0_0_0_1px_rgba(37,99,235,0.2)] z-18 hover:z-26'
-                    : 'border border-transparent hover:border-blue-500/70 hover:shadow-[0_0_0_2px_rgba(37,99,235,0.2)] z-18 hover:z-26'
-                }`}
-                style={{
-                  left: renderLeft,
-                  top: origTop,
+              <React.Fragment key={`wrap-${block.id}`}>
+                {/* Independent White-out mask at original position if shifted */}
+                {renderTop !== origTop && !currentEdit?.isSyntheticLine && (
+                  <div
+                    key={`orig-mask-${block.id}`}
+                    className="absolute pointer-events-none"
+                    style={{
+                      left: origLeft,
+                      top: origTop,
+                      width: origWidth,
+                      height: Math.max(boxHeight, origHeight),
+                      backgroundColor: bgColor,
+                      zIndex: 14,
+                    }}
+                    aria-hidden="true"
+                  />
+                )}
+                <div
+                  key={`edited-${block.id}`}
+                  className={`absolute box-border cursor-pointer pointer-events-auto select-none transition-all ${
+                    isSelected
+                      ? 'border-2 border-blue-600 shadow-[0_0_0_2px_rgba(37,99,235,0.35)] z-28'
+                      : isSelectedParaMember
+                      ? 'border border-blue-500/70 bg-blue-500/10 shadow-[0_0_0_1px_rgba(37,99,235,0.25)] z-20'
+                      : hasLink
+                      ? 'border border-blue-500/50 hover:border-blue-500 shadow-[0_0_0_1px_rgba(37,99,235,0.2)] z-18 hover:z-26'
+                      : 'border border-transparent hover:border-blue-500/70 hover:shadow-[0_0_0_2px_rgba(37,99,235,0.2)] z-18 hover:z-26'
+                  }`}
+                  style={{
+                    left: renderLeft,
+                    top: renderTop,
                   width: needsFullParaWidth ? paraWidth : renderWidth,
                   height: boxHeight,
                   minHeight: boxHeight,
@@ -899,8 +978,9 @@ export function PdfPage({
                   </span>
                 )}
               </div>
-            );
-          }
+            </React.Fragment>
+          );
+        }
 
           return (
             <div
@@ -916,7 +996,7 @@ export function PdfPage({
               }`}
               style={{
                 left: block.screenLeft ?? block.left,
-                top: (block.screenTop ?? block.top) - 2,
+                top: (currentEdit?.isShifted && Number.isFinite(currentEdit.block?.pdfTop) ? currentEdit.block.pdfTop * scale : (block.screenTop ?? block.top)) - 2,
                 width: block.screenWidth ?? block.width,
                 height: (block.screenHeight ?? block.height) + 4,
               }}

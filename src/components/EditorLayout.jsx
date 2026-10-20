@@ -37,6 +37,8 @@ import { OrganizePagesModal } from './OrganizePagesModal.jsx';
 import { KeyboardShortcutsModal } from './KeyboardShortcutsModal.jsx';
 import { DEFAULT_WATERMARK_CONFIG, DEFAULT_PAGE_NUMBER_CONFIG } from '../features/advanced/watermarkManager.js';
 import { reflowParagraphText } from '../features/editing/pdfContentEditor.js';
+import { calculatePageReflow } from '../features/editing/layoutEngine.js';
+import { DocumentFlowEditor } from './DocumentFlowEditor.jsx';
 import { Textbox } from 'fabric';
 import { runOcrOnFile } from '../utils/ocr.js';
 import { Loader2, AlertCircle, X } from 'lucide-react';
@@ -70,6 +72,7 @@ export function EditorLayout({
   });
   const [activePage, setActivePage] = useState(1);
   const [activeTool, setActiveTool] = useState('edit-content'); // 'edit-content' | 'pen'
+  const [editorMode, setEditorMode] = useState('original'); // 'original' (Mode 1: Layout Fidelity) | 'flow' (Mode 2: Word-like Document Flow)
   const [signatureModalOpen, setSignatureModalOpen] = useState(false);
   const [shortcutsModalOpen, setShortcutsModalOpen] = useState(false);
 
@@ -95,6 +98,15 @@ export function EditorLayout({
 
   // Per-page serialized canvas state { [pageId]: fabricJson }
   const [pageEdits, setPageEdits] = useState({});
+  const [pageTextBlocks, setPageTextBlocks] = useState({});
+  const [overflowNotice, setOverflowNotice] = useState(null);
+
+  const handlePageTextBlocksExtracted = useCallback((pageId, blocks) => {
+    setPageTextBlocks((prev) => {
+      if (prev[pageId] === blocks) return prev;
+      return { ...prev, [pageId]: blocks };
+    });
+  }, []);
 
   // Active selected object and its host canvas
   const [selectedObjectProps, setSelectedObjectProps] = useState(null);
@@ -533,7 +545,7 @@ export function EditorLayout({
   // Select a text block on any page (with unified paragraph clustering & reflow support)
   const handleSelectContentBlock = useCallback((pageId, pageNumber, block, currentText) => {
     const isImageBlock = Boolean(isImage || block.isOcrDetected || block.id?.startsWith('img-'));
-    const isPara = !isImageBlock && Boolean(block.isParagraphMember && Array.isArray(block.paraLines) && block.paraLines.length > 1);
+    const isPara = !isImageBlock && Boolean(block.isParagraphMember && Array.isArray(block.paraLines) && block.paraLines.length >= 1);
 
     let initialText = currentText;
     let initialOriginalText = block.originalStr || block.str;
@@ -545,26 +557,39 @@ export function EditorLayout({
       initialText = currentText ?? (currentEdits[block.id]?.text ?? block.str ?? '');
       initialOriginalText = block.originalStr || block.str;
     } else if (isPara) {
-      const paraTexts = [];
-      for (const line of block.paraLines) {
-        const edit = currentEdits[line.id];
-        if (edit?.isClearedLine) continue;
-        if (edit !== undefined) {
-          paraTexts.push(edit.text ?? '');
-        } else {
-          paraTexts.push(line.originalStr || line.str || '');
+      // ONE SOURCE OF TRUTH: If this paragraph was edited and saved, use the saved authoritative text
+      const paraKey = block.paraId || (block.isParagraphMember && block.paraLines?.[0]?.paraId) || block.id;
+      const existingPara = pageEdits[pageId]?.paragraphEdits?.[paraKey] || (block.paraId && pageEdits[pageId]?.paragraphEdits?.[block.paraId]);
+      if (existingPara?.text !== undefined) {
+        initialText = existingPara.text;
+      } else {
+        const paraTexts = [];
+        const paraLineIds = new Set((block.paraLines || []).map((l) => l.id));
+        for (const line of block.paraLines) {
+          const edit = currentEdits[line.id];
+          if (edit?.isClearedLine) continue;
+          if (edit !== undefined) {
+            paraTexts.push(edit.text ?? '');
+          } else {
+            paraTexts.push(line.originalStr || line.str || '');
+          }
         }
+        for (const [editId, edit] of Object.entries(currentEdits)) {
+          if (edit?.isSyntheticLine && edit?.block?.paraId === block.paraId && !paraLineIds.has(editId)) {
+            paraTexts.push(edit.text ?? '');
+          }
+        }
+        initialText = paraTexts
+          .filter((t) => t !== undefined && t !== null && String(t).trim() !== '')
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .trim();
       }
-      initialText = paraTexts
-        .filter((t) => t !== undefined && t !== null && String(t).trim() !== '')
-        .join(' ')
-        .replace(/\s+/g, ' ')
-        .trim();
       initialOriginalText = block.paraLines.map((l) => l.originalStr || l.str).filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
     }
 
     const effectiveBlock = currentEdits[block.id]?.block || block;
-    const effectiveParaLines = isPara
+    const baseParaLines = isPara
       ? (block.paraLines || []).filter((line) => !currentEdits[line.id]?.isClearedLine).map((line) => {
         return currentEdits[line.id]?.block || {
           ...line,
@@ -581,6 +606,14 @@ export function EditorLayout({
         };
       })
       : [];
+
+    const syntheticParaLines = isPara
+      ? Object.entries(currentEdits)
+        .filter(([editId, edit]) => edit?.isSyntheticLine && edit?.block?.paraId === block.paraId && !(block.paraLines || []).some((l) => l.id === editId))
+        .map(([, edit]) => edit.block)
+      : [];
+
+    const effectiveParaLines = [...baseParaLines, ...syntheticParaLines];
 
     setSelectedObjectProps({
       type: 'textbox',
@@ -953,10 +986,81 @@ export function EditorLayout({
     const isLinkOnly = isTextUnmodified && Boolean(exactLinkUrl && exactLinkUrl.trim().length > 0);
 
     const isImageDoc = Boolean(isImage || selectedObj.block?.isOcrDetected || selectedObj.blockId?.startsWith('img-'));
-    const isPara = scope === 'paragraph' && !isImageDoc && Boolean(selectedObj.isParagraphMember && Array.isArray(selectedObj.paraLines) && selectedObj.paraLines.length > 1);
+    const isPara = scope === 'paragraph' && !isImageDoc && Boolean(selectedObj.isParagraphMember && Array.isArray(selectedObj.paraLines) && selectedObj.paraLines.length >= 1);
 
     setPageEdits((prev) => {
       const prevPageData = prev[pageId] || { version: '6.0.0', objects: [] };
+
+      // Automatic section reflow when editing paragraphs
+      if (!isImageDoc && (isPara || scope === 'paragraph')) {
+        const pageObj = pages.find((p) => p.id === pageId);
+        const allBlocks = pageTextBlocks[pageId] || (selectedObj.paraLines && selectedObj.paraLines.length > 0 ? selectedObj.paraLines : [block]);
+
+        const existingParaEdits = { ...(prevPageData.paragraphEdits || {}) };
+        const paraKey = selectedObj.paraId || (selectedObj.block?.paraId) || selectedObj.blockId;
+        existingParaEdits[paraKey] = {
+          text: newText,
+          fontSize: exactFontSize,
+          fontFamily: exactFontFamily,
+          isBold: exactFontWeight === 'bold',
+          isItalic: exactFontStyle === 'italic',
+          color: exactColor,
+          backgroundColor: exactBg,
+          textAlign: exactAlign,
+          linkUrl: exactLinkUrl,
+        };
+
+        const canvasNonContentObjects = (prevPageData.objects || []).filter((o) => !o.isPdfContentEdit);
+
+        const reflowResult = calculatePageReflow({
+          allBlocks,
+          paragraphEdits: existingParaEdits,
+          canvasObjects: canvasNonContentObjects,
+          options: {
+            pageHeight: pageObj?.height || 792,
+            pageWidth: pageObj?.width || 612,
+            bottomMargin: 45,
+          },
+        });
+
+        if (reflowResult.overflowInfo.hasOverflow) {
+          const ovMsg = reflowResult.overflowInfo.message || `Page ${selectedObj.pageNumber || ''} content reached page boundary (+${Math.round(reflowResult.overflowInfo.overflowingBlocks[0]?.overflowAmount || 0)}pt). Layout adjusted safely without clipping.`;
+          setOverflowNotice(ovMsg);
+        } else {
+          setOverflowNotice(null);
+        }
+
+        // Shift any vector canvas objects on active canvas
+        const activeCanvas = canvasRegistryRef.current.get(pageId);
+        if (activeCanvas && reflowResult.shiftedCanvasObjects.length > 0) {
+          activeCanvas.forEachObject((obj) => {
+            const match = reflowResult.shiftedCanvasObjects.find((so) => so.id && so.id === obj.id);
+            if (match && Number.isFinite(match.top)) {
+              obj.set('top', match.top);
+              if (Number.isFinite(match.y1) && Number.isFinite(match.y2)) {
+                obj.set('y1', match.y1);
+                obj.set('y2', match.y2);
+              }
+              obj.setCoords();
+            }
+          });
+          activeCanvas.renderAll();
+        }
+
+        return {
+          ...prev,
+          [pageId]: {
+            ...prevPageData,
+            paragraphEdits: existingParaEdits,
+            contentEdits: reflowResult.contentEdits,
+            objects: [...reflowResult.shiftedCanvasObjects, ...reflowResult.exportObjects],
+            downstreamShift: reflowResult.downstreamShift || 0,
+            splitPdfY: reflowResult.splitPdfY,
+            splitTop: reflowResult.splitTop,
+          },
+        };
+      }
+
       const currentContentEdits = { ...(prevPageData.contentEdits || {}) };
 
       if (isPara) {
@@ -1213,7 +1317,7 @@ export function EditorLayout({
       textAlign: exactAlign,
       linkUrl: exactLinkUrl,
     } : null));
-  }, [pages, pageEdits, recordChange, isImage]);
+  }, [pages, pageEdits, recordChange, isImage, pageTextBlocks, editorMode]);
 
   // Reset a PDF content block back to original
   const handleResetContentEdit = useCallback((selectedObj) => {
@@ -1222,8 +1326,75 @@ export function EditorLayout({
 
     recordChange({ pages, pageEdits });
 
+    const isImageDoc = Boolean(isImage || selectedObj.block?.isOcrDetected || selectedObj.blockId?.startsWith('img-'));
+
     setPageEdits((prev) => {
       const prevPageData = prev[pageId] || { version: '6.0.0', objects: [] };
+
+      // Revert layout reflow for PDF paragraphs
+      const isParaBlock = Boolean(block?.isParagraphMember || selectedObj?.paraId || (prevPageData.paragraphEdits && (prevPageData.paragraphEdits[block?.paraId] || prevPageData.paragraphEdits[blockId])));
+      if (!isImageDoc && isParaBlock) {
+        const pageObj = pages.find((p) => p.id === pageId);
+        const allBlocks = pageTextBlocks[pageId] || (block?.paraLines && block.paraLines.length > 0 ? block.paraLines : [block]);
+        const existingParaEdits = { ...(prevPageData.paragraphEdits || {}) };
+        const paraKey = block?.paraId || blockId;
+        delete existingParaEdits[paraKey];
+        if (block?.paraLines) {
+          for (const l of block.paraLines) {
+            delete existingParaEdits[l.id];
+          }
+        }
+        if (selectedObj?.paraLines) {
+          for (const l of selectedObj.paraLines) {
+            delete existingParaEdits[l.id];
+          }
+        }
+
+        const canvasNonContentObjects = (prevPageData.objects || []).filter((o) => !o.isPdfContentEdit);
+
+        const reflowResult = calculatePageReflow({
+          allBlocks,
+          paragraphEdits: existingParaEdits,
+          canvasObjects: canvasNonContentObjects,
+          options: {
+            pageHeight: pageObj?.height || 792,
+            pageWidth: pageObj?.width || 612,
+            bottomMargin: 45,
+          },
+        });
+
+        setOverflowNotice(null);
+
+        // Reset any vector canvas objects on active canvas
+        const activeCanvas = canvasRegistryRef.current.get(pageId);
+        if (activeCanvas) {
+          activeCanvas.forEachObject((obj) => {
+            if (Number.isFinite(obj.origTop)) {
+              obj.set('top', obj.origTop);
+              if (Number.isFinite(obj.origY1) && Number.isFinite(obj.origY2)) {
+                obj.set('y1', obj.origY1);
+                obj.set('y2', obj.origY2);
+              }
+              obj.setCoords();
+            }
+          });
+          activeCanvas.renderAll();
+        }
+
+        return {
+          ...prev,
+          [pageId]: {
+            ...prevPageData,
+            paragraphEdits: existingParaEdits,
+            contentEdits: reflowResult.contentEdits,
+            objects: [...reflowResult.shiftedCanvasObjects, ...reflowResult.exportObjects],
+            downstreamShift: reflowResult.downstreamShift || 0,
+            splitPdfY: reflowResult.splitPdfY,
+            splitTop: reflowResult.splitTop,
+          },
+        };
+      }
+
       const currentContentEdits = { ...(prevPageData.contentEdits || {}) };
 
       if (block?.isParagraphMember && Array.isArray(block.paraLines) && block.paraLines.length > 1) {
@@ -1260,7 +1431,7 @@ export function EditorLayout({
     });
 
     setSelectedObjectProps((prev) => (prev ? { ...prev, text: originalText } : null));
-  }, [pages, pageEdits, recordChange]);
+  }, [pages, pageEdits, recordChange, isImage, pageTextBlocks, editorMode]);
 
   // ==========================================
   // ADVANCED FEATURES HANDLERS (PHASE 5)
@@ -1512,6 +1683,8 @@ export function EditorLayout({
         activePage={activePage}
         scale={scale}
         activeTool={activeTool}
+        editorMode={editorMode}
+        onSelectEditorMode={setEditorMode}
         canUndo={canUndo}
         canRedo={canRedo}
         isImage={isImage}
@@ -1538,38 +1711,62 @@ export function EditorLayout({
       />
 
       <div className="flex flex-1 w-full min-h-0 overflow-hidden relative">
-        {/* Central PDF Workspace */}
-        <main ref={workspaceRef} className="flex-1 h-full overflow-auto bg-[#0f141c] flex flex-col items-center py-6 px-2 md:py-10 md:px-6 gap-6 md:gap-8 scroll-smooth relative touch-pan-x touch-pan-y">
-          {pages.map((page, index) => {
-            const pageNum = index + 1;
-            const pageDoc = (page.sourceDocId && sourcePdfDocs[page.sourceDocId])
-              ? sourcePdfDocs[page.sourceDocId]
-              : pdfDoc;
+        {editorMode === 'flow' ? (
+          <DocumentFlowEditor
+            allBlocks={Object.values(pageTextBlocks).flat()}
+            fileName={fileName}
+            onSwitchToOriginal={() => setEditorMode('original')}
+          />
+        ) : (
+          /* Central PDF Workspace */
+          <main ref={workspaceRef} className="flex-1 h-full overflow-auto bg-[#0f141c] flex flex-col items-center py-6 px-2 md:py-10 md:px-6 gap-6 md:gap-8 scroll-smooth relative touch-pan-x touch-pan-y">
+            {overflowNotice && (
+              <div className="sticky top-2 z-40 flex items-center gap-2.5 bg-amber-500/15 border border-amber-500/40 text-amber-200 text-xs px-4 py-2 rounded-xl shadow-xl backdrop-blur-md animate-in fade-in max-w-lg">
+                <AlertCircle size={15} className="text-amber-400 shrink-0" />
+                <span className="flex-1">{overflowNotice}</span>
+                <button
+                  type="button"
+                  onClick={() => setOverflowNotice(null)}
+                  className="p-1 text-amber-400 hover:text-white rounded-md hover:bg-white/10 transition-colors"
+                  title="Dismiss notice"
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            )}
 
-            return (
-              <PdfPage
-                key={page.id}
-                pdfDoc={pageDoc}
-                page={page}
-                pageNumber={pageNum}
-                scale={scale}
-                activeTool={activeTool}
-                savedEdits={pageEdits[page.id] || null}
-                selectedBlockId={selectedObjectProps?.isPdfContentEdit ? selectedObjectProps.blockId : null}
-                selectedObject={selectedObjectProps}
-                initialOcrBlocks={pageNum === 1 ? initialOcrBlocks : null}
-                onSelectContentBlock={handleSelectContentBlock}
-                onApplyAlignment={handleApplyAlignment}
-                onPageVisible={handlePageVisible}
-                onPageEditsChange={handlePageEditsChange}
-                onObjectSelected={handleObjectSelected}
-                onObjectDeselected={handleObjectDeselected}
-                onRegisterCanvas={registerCanvas}
-                onUnregisterCanvas={unregisterCanvas}
-              />
-            );
-          })}
-        </main>
+            {pages.map((page, index) => {
+              const pageNum = index + 1;
+              const pageDoc = (page.sourceDocId && sourcePdfDocs[page.sourceDocId])
+                ? sourcePdfDocs[page.sourceDocId]
+                : pdfDoc;
+
+              return (
+                <PdfPage
+                  key={page.id}
+                  pdfDoc={pageDoc}
+                  page={page}
+                  pageNumber={pageNum}
+                  scale={scale}
+                  activeTool={activeTool}
+                  savedEdits={pageEdits[page.id] || null}
+                  selectedBlockId={selectedObjectProps?.isPdfContentEdit ? selectedObjectProps.blockId : null}
+                  selectedObject={selectedObjectProps}
+                  initialOcrBlocks={pageNum === 1 ? initialOcrBlocks : null}
+                  onSelectContentBlock={handleSelectContentBlock}
+                  onApplyAlignment={handleApplyAlignment}
+                  onPageVisible={handlePageVisible}
+                  onPageEditsChange={handlePageEditsChange}
+                  onObjectSelected={handleObjectSelected}
+                  onObjectDeselected={handleObjectDeselected}
+                  onRegisterCanvas={registerCanvas}
+                  onUnregisterCanvas={unregisterCanvas}
+                  onPageTextBlocksExtracted={handlePageTextBlocksExtracted}
+                />
+              );
+            })}
+          </main>
+        )}
 
         {/* Right Properties Panel Mobile Backdrop */}
         {selectedObjectProps && (

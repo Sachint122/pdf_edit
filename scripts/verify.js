@@ -224,6 +224,82 @@ function runBuildAudit() {
 }
 
 // ============================================================================
+// STEP 4: Word-Like Paragraph Expansion & Section Reflow Test Suite
+// ============================================================================
+function runReflowTestSuite() {
+  logStep(4, 'Verifying Word-Like Paragraph Expansion & Section Reflow Engine');
+  try {
+    const output = execSync('node scripts/test-reflow.js', { cwd: ROOT_DIR, stdio: 'pipe' }).toString();
+    const match = output.match(/ALL (\d+)\/\1/);
+    if (match) {
+      logSuccess(`All ${match[1]} paragraph expansion and section reflow verification tests passed.`);
+      return true;
+    }
+    console.log(output);
+    return true;
+  } catch (err) {
+    const output = (err.stdout ? err.stdout.toString() : '') + (err.stderr ? err.stderr.toString() : '');
+    logError('Reflow verification test suite failed:');
+    console.error(output);
+    return false;
+  }
+}
+
+// ============================================================================
+// STEP 5: Dual-Mode Architecture Verification (Mode 1 Fidelity & Mode 2 Flow)
+// ============================================================================
+function runArchitectureTestSuite() {
+  logStep(5, 'Verifying Dual-Mode Architecture (Mode 1 Fidelity & Mode 2 Flow)');
+  try {
+    const testScript = path.resolve(ROOT_DIR, 'scripts', 'test-architecture.js');
+    const output = execSync(`node "${testScript}"`, {
+      cwd: ROOT_DIR,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf-8',
+    });
+    const match = output.match(/ALL (\d+) DUAL-MODE ARCHITECTURE TESTS PASSED/i);
+    if (match) {
+      logSuccess(`All ${match[1]} dual-mode architecture tests passed.`);
+      return true;
+    }
+    console.log(output);
+    return true;
+  } catch (err) {
+    const output = (err.stdout ? err.stdout.toString() : '') + (err.stderr ? err.stderr.toString() : '');
+    logError('Dual-mode architecture test suite failed:');
+    console.error(output);
+    return false;
+  }
+}
+
+// ============================================================================
+// STEP 6: Real Resume PDF Reflow & Overlap Verification (Scenarios A through G)
+// ============================================================================
+function runRealResumeReflowSuite() {
+  logStep(6, 'Verifying Real Resume Reflow & Overlap Prevention (Scenarios A-G)');
+  try {
+    const testScript = path.resolve(ROOT_DIR, 'scripts', 'test-real-resume-reflow.js');
+    const output = execSync(`node "${testScript}"`, {
+      cwd: ROOT_DIR,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf-8',
+    });
+    const match = output.match(/ALL (\d+) REAL RESUME REFLOW TESTS PASSED/i);
+    if (match) {
+      logSuccess(`All ${match[1]} real resume reflow and overlap tests passed.`);
+      return true;
+    }
+    console.log(output);
+    return true;
+  } catch (err) {
+    const output = (err.stdout ? err.stdout.toString() : '') + (err.stderr ? err.stderr.toString() : '');
+    logError('Real resume reflow test suite failed:');
+    console.error(output);
+    return false;
+  }
+}
+
+// ============================================================================
 // MAIN RUNNER
 // ============================================================================
 function main() {
@@ -234,9 +310,12 @@ function main() {
   const step1 = runLintAudit();
   const step2 = runImportExportAudit();
   const step3 = runBuildAudit();
+  const step4 = runReflowTestSuite();
+  const step5 = runArchitectureTestSuite();
+  const step6 = runRealResumeReflowSuite();
 
   console.log(`\n${COLORS.bold}===================================================${COLORS.reset}`);
-  if (step1 && step2 && step3) {
+  if (step1 && step2 && step3 && step4 && step5 && step6) {
     console.log(`${COLORS.green}${COLORS.bold}  ✔ ALL CHECKS PASSED — CODEBASE READY FOR RELEASE!${COLORS.reset}`);
     console.log(`${COLORS.bold}===================================================${COLORS.reset}\n`);
     process.exit(0);

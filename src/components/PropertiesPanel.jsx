@@ -31,7 +31,7 @@ import {
 
 function ContentEditSection({ selectedObject, onSaveContentEdit, onResetContentEdit, onApplyAlignment, onClose }) {
   const isPara = Boolean(selectedObject.isParagraphMember && selectedObject.paraLines && selectedObject.paraLines.length > 1);
-  const [editScope, setEditScope] = useState('paragraph'); // 'paragraph' | 'line'
+  const [editScope, setEditScope] = useState(() => (isPara ? 'paragraph' : 'line'));
   const targetText = selectedObject.text ?? '';
   const targetColor = selectedObject.fill || selectedObject.block?.fill || selectedObject.block?.color || '#000000';
   const targetAlign = selectedObject.textAlign || 'left';
@@ -43,11 +43,12 @@ function ContentEditSection({ selectedObject, onSaveContentEdit, onResetContentE
   const [contentLinkUrl, setContentLinkUrl] = useState(targetLinkUrl);
 
   useEffect(() => {
+    setEditScope(isPara ? 'paragraph' : 'line');
     setContentEditText(targetText);
     setContentColor(targetColor);
     setContentAlign(targetAlign);
     setContentLinkUrl(targetLinkUrl);
-  }, [selectedObject.blockId, targetColor, targetAlign, targetLinkUrl, targetText]);
+  }, [selectedObject.blockId, isPara, targetColor, targetAlign, targetLinkUrl, targetText]);
 
   const detectedFontSize = Math.round(selectedObject.block?.rawFontSize || selectedObject.block?.fontSize || selectedObject.fontSize || 12);
   const detectedFontFamily = selectedObject.block?.fontFamily || selectedObject.fontFamily || 'Helvetica';

@@ -4,7 +4,18 @@
  * and vector editing layers (text, shapes, drawings, images, signatures) into a valid modified PDF using pdf-lib.
  */
 
-import { PDFDocument, degrees, rgb, PDFName, PDFString } from 'pdf-lib';
+import {
+  PDFDocument,
+  degrees,
+  rgb,
+  PDFName,
+  PDFString,
+  pushGraphicsState,
+  popGraphicsState,
+  rectangle,
+  clip,
+  endPath,
+} from 'pdf-lib';
 import { FontManager } from './fontManager.js';
 import { toPdfLibRgb } from './colorParser.js';
 import { applyWatermark, applyPageNumber } from '../advanced/watermarkManager.js';
@@ -216,11 +227,59 @@ export async function exportModifiedPdf(originalBuffer, pages = [], pageEdits = 
       await applyPageNumber(targetPage, i, totalPages, options.pageNumbers, fontManager);
     }
 
-    const { height: pHeight } = targetPage.getSize();
+    const { width: pWidth, height: pHeight } = targetPage.getSize();
 
     // C. Render Vector Editing Objects for this page
     const edits = pageEdits[pageConfig.id];
     const objects = edits?.objects || [];
+
+    // Native Downstream Shift: When an expanded paragraph exceeds available whitespace,
+    // shift downstream content using native PDF Form XObject slicing, preserving 100% of the
+    // original TrueType fonts, vector divider lines, colors, bullets, dates, and relative layout.
+    const downstreamShift = edits?.downstreamShift || 0;
+    const splitPdfY = edits?.splitPdfY;
+
+    if (downstreamShift > 0 && Number.isFinite(splitPdfY) && sourceDoc && pageConfig.originalIndex) {
+      try {
+        const srcPageIndex = pageConfig.originalIndex - 1;
+        const srcPage = sourceDoc.getPage(srcPageIndex);
+
+        const bottomPart = await outDoc.embedPage(srcPage, {
+          left: 0,
+          bottom: 0,
+          right: pWidth,
+          top: splitPdfY,
+        });
+
+        // Clean whiteout over original bottom section
+        targetPage.drawRectangle({
+          x: 0,
+          y: 0,
+          width: pWidth,
+          height: splitPdfY + 1,
+          color: rgb(1, 1, 1),
+        });
+
+        // Set explicit clipping path on targetPage so bottomPart CANNOT draw anything above (splitPdfY - downstreamShift)
+        const contentStream = targetPage.getContentStream();
+        contentStream.push(
+          pushGraphicsState(),
+          rectangle(0, 0, pWidth, splitPdfY - downstreamShift),
+          clip(),
+          endPath()
+        );
+
+        // Draw the native bottom slice shifted down by downstreamShift
+        targetPage.drawPage(bottomPart, {
+          x: 0,
+          y: -downstreamShift,
+        });
+
+        contentStream.push(popGraphicsState());
+      } catch (sliceErr) {
+        console.warn('Could not apply native downstream slice shift:', sliceErr);
+      }
+    }
 
     for (const obj of objects) {
       try {
@@ -257,12 +316,14 @@ export async function exportModifiedPdf(originalBuffer, pages = [], pageEdits = 
             }
 
             // Precise whiteout masking per line to avoid overlapping subsequent lines or headers
-            const whiteoutLines = linesInfo || [{
-              pdfLeft: objLeft,
-              pdfWidth: Math.max((obj.width || 100) * (obj.scaleX || 1), maxReplacementTextWidth),
-              rawFontSize: fontSize,
-              baseVy: objTop + fontSize * 0.76,
-            }];
+            const whiteoutLines = (Array.isArray(obj.whiteoutLines) && obj.whiteoutLines.length > 0)
+              ? obj.whiteoutLines
+              : (linesInfo || [{
+                pdfLeft: objLeft,
+                pdfWidth: Math.max((obj.width || 100) * (obj.scaleX || 1), maxReplacementTextWidth),
+                rawFontSize: fontSize,
+                baseVy: objTop + fontSize * 0.76,
+              }]);
 
             if (obj.backgroundColor && obj.backgroundColor !== 'transparent') {
               const bgRgb = toPdfLibRgb(obj.backgroundColor) || rgb(1, 1, 1);
@@ -277,13 +338,12 @@ export async function exportModifiedPdf(originalBuffer, pages = [], pageEdits = 
                 const lBaseVy = Number.isFinite(lInfo.baseVy) ? lInfo.baseVy : (objTop + lFontSize * 0.76);
 
                 // Baseline in PDF-lib coordinates: yBaseline = pHeight - lBaseVy
-                // Ascenders reach up to yBaseline + 0.76 * fontSize
-                // Descenders reach down to yBaseline - 0.20 * fontSize
-                // Bottom of whiteout rectangle = yBaseline - 0.20 * fontSize
-                // Height = 0.96 * fontSize
-                // Top of whiteout rectangle = yBaseline + 0.76 * fontSize
-                const stripY = pHeight - lBaseVy - (lFontSize * 0.20);
-                const stripHeight = lFontSize * 0.96;
+                // Ascenders reach up to yBaseline + 0.88 * fontSize
+                // Descenders reach down to yBaseline - 0.26 * fontSize
+                // Bottom of whiteout rectangle = yBaseline - 0.26 * fontSize
+                // Height = 1.18 * fontSize
+                const stripY = pHeight - lBaseVy - (lFontSize * 0.26);
+                const stripHeight = lFontSize * 1.18;
                 const maskWidth = Math.max(origWidth, maxReplacementTextWidth) + 4;
 
                 targetPage.drawRectangle({
